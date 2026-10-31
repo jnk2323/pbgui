@@ -10,6 +10,9 @@ All tests are isolated and avoid live exchange/API dependencies.
 import sys
 import importlib.util
 import json
+import io
+import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +42,242 @@ PBRun_mod = importlib.util.module_from_spec(pbrun_spec)
 pbrun_spec.loader.exec_module(PBRun_mod)
 
 DynamicIgnore = PBRun_mod.DynamicIgnore
+
+
+
+@pytest.mark.parametrize("binary", [False, True])
+def test_stderr_reader_preserves_timestamp_filter_and_decoding(tmp_path, binary):
+    """Raw diagnostics retain UTC prefixes, replacement decoding and filtering."""
+    lines = ["  raw message  \n", " \n", "2026-10-31T12:34:56Z existing log\n"]
+    pipe = io.BytesIO(b"".join(line.encode() for line in lines) + b"bad \xff\n") if binary else io.StringIO("".join(lines))
+    logfile = tmp_path / "diagnostic.log"
+
+    PBRun_mod._ts_wrap_stderr(pipe, str(logfile))
+
+    written = logfile.read_text().splitlines()
+    assert len(written) == (2 if binary else 1)
+    for line in written:
+        assert line[4] == "-" and line[7] == "-" and line[10] == "T" and line[19:21] == "Z "
+    assert written[0][21:] == "raw message"
+    if binary:
+        assert written[1][21:] == "bad \ufffd"
+    assert pipe.closed
+
+
+def test_stderr_reader_skips_empty_and_filtered_output_without_opening_log(tmp_path, monkeypatch):
+    """Lazy opening needs no empty file and supports iterators without close()."""
+    def unexpected_open(*_args, **_kwargs):
+        """Fail if filtered output triggers diagnostic file access."""
+        pytest.fail("Filtered output must not open a diagnostic log")
+
+    monkeypatch.setattr(PBRun_mod, "open", unexpected_open, raising=False)
+    PBRun_mod._ts_wrap_stderr(iter(("\n", "2026-10-31T12:34:56Z existing\n")), str(tmp_path / "absent.log"))
+    assert not (tmp_path / "absent.log").exists()
+
+
+@pytest.mark.parametrize("stage", ["open", "write", "short_write", "encode", "format"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_stderr_reader_recovers_log_without_pausing_drain(tmp_path, monkeypatch, stage, error_type):
+    """Sink failures drop lines, throttle by monotonic time and recover later."""
+    now = [100.0]
+    opened_at = []
+    consumed = []
+    failed_closes = []
+    logfile = tmp_path / "recovered.log"
+    real_open = open
+    real_datetime = PBRun_mod.datetime
+
+    class FailedLog:
+        """Model a failed unbuffered sink, including a failing close."""
+        def write(self, _payload):
+            """Raise a write failure or return a partial write."""
+            if stage == "short_write":
+                return 1
+            raise error_type("diagnostic write failure")
+
+        def close(self):
+            """Record and fail cleanup without stopping pipe consumption."""
+            failed_closes.append(True)
+            raise error_type("diagnostic close failure")
+
+    class Clock:
+        """Fail timestamp formatting once, then use the real UTC clock."""
+        calls = 0
+
+        @classmethod
+        def utcnow(cls):
+            """Exercise timestamp failure inside the sink error boundary."""
+            cls.calls += 1
+            if cls.calls == 1:
+                raise error_type("diagnostic timestamp failure")
+            return real_datetime.utcnow()
+
+    def diagnostic_open(path, mode, *, buffering):
+        """Fail the first open/sink, then open a real isolated log."""
+        assert (path, mode, buffering) == (str(logfile), "ab", 0)
+        opened_at.append(now[0])
+        if len(opened_at) == 1:
+            if stage == "open":
+                raise error_type("diagnostic open failure")
+            return FailedLog()
+        return real_open(path, mode, buffering=buffering)
+
+    def output():
+        """Advance a fake monotonic clock while recording every consumed line."""
+        for timestamp, line in [(100.0, "\ud800\n" if stage == "encode" else "lost first\n"),
+                                (129.0, "lost during cooldown\n"), (130.0, "recovered\n")]:
+            now[0] = timestamp
+            consumed.append(line)
+            yield line
+
+    monkeypatch.setattr(PBRun_mod, "monotonic", lambda: now[0])
+    monkeypatch.setattr(PBRun_mod, "open", diagnostic_open, raising=False)
+    if stage == "format":
+        monkeypatch.setattr(PBRun_mod, "datetime", Clock)
+
+    PBRun_mod._ts_wrap_stderr(output(), str(logfile))
+
+    assert len(consumed) == 3
+    assert opened_at == [100.0, 130.0]
+    assert logfile.read_text().splitlines()[0][21:] == "recovered"
+    assert len(logfile.read_text().splitlines()) == 1
+    assert failed_closes == ([] if stage == "open" else [True])
+
+
+@pytest.mark.parametrize("read_error", [None, OSError("pipe read failure"), ValueError("closed pipe"),
+                                        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")])
+@pytest.mark.parametrize("close_error", [OSError, ValueError])
+def test_stderr_reader_closes_owned_handles_on_eof_and_read_errors(monkeypatch, read_error, close_error):
+    """EOF and terminal read/decode errors quietly release both owned handles."""
+    closed = []
+
+    class Log:
+        """Track log cleanup independently of pipe cleanup."""
+        def write(self, payload):
+            """Accept the first diagnostic before a terminal read failure."""
+            return len(payload)
+
+        def close(self):
+            """A failed log close must not prevent pipe close."""
+            closed.append("log")
+            raise close_error("log close failure")
+
+    class Pipe:
+        """Yield one line and then EOF or a terminal read failure."""
+        def __iter__(self):
+            """Exercise a failure originating in iteration, not in the sink."""
+            yield "raw diagnostic\n"
+            if read_error is not None:
+                raise read_error
+
+        def close(self):
+            """Record a pipe close even when closing itself fails."""
+            closed.append("pipe")
+            raise close_error("pipe close failure")
+
+    monkeypatch.setattr(PBRun_mod, "open", lambda *_args, **_kwargs: Log(), raising=False)
+    PBRun_mod._ts_wrap_stderr(Pipe(), "unused.log")
+    assert closed == ["log", "pipe"]
+
+
+@pytest.mark.parametrize("merged", [False, True], ids=["pb7_stderr", "pb8_merged"])
+@pytest.mark.parametrize("failure", ["open", "write_enospc"])
+def test_stderr_reader_drains_real_child_beyond_pipe_capacity(tmp_path, monkeypatch, merged, failure):
+    """A synthetic child finishes large output despite a failed diagnostic sink."""
+    line_count = 16384
+    line_size = 1024
+    child_code = (
+        "import os, sys\n"
+        "merged = sys.argv[1] == '1'\n"
+        "for i in range(16384):\n"
+        "    fd = 1 if merged and i % 2 == 0 else 2\n"
+        "    line = (b'out' if fd == 1 else b'err') + b'x' * 1020 + b'\\n'\n"
+        "    os.write(fd, line)\n"
+    )
+    errors = []
+    opened = []
+    closed = []
+    counts = {"lines": 0, "chars": 0, "out": 0, "err": 0}
+
+    class FailedLog:
+        """Surface ENOSPC immediately and exercise failing close isolation."""
+        def write(self, _payload):
+            """A full diagnostic filesystem must not stop draining."""
+            raise OSError(28, "No space left on device")
+
+        def close(self):
+            """A second sink failure must not stop draining either."""
+            closed.append("log")
+            raise OSError(28, "No space left on device")
+
+    def diagnostic_open(*_args, **_kwargs):
+        """Touch no filesystem while injecting a persistent sink failure."""
+        opened.append(True)
+        if failure == "open":
+            raise OSError(28, "No space left on device")
+        return FailedLog()
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code, "1" if merged else "0"],
+        cwd=tmp_path, stdout=subprocess.PIPE if merged else subprocess.DEVNULL,
+        stderr=subprocess.STDOUT if merged else subprocess.PIPE, text=True,
+    )
+    pipe = proc.stdout if merged else proc.stderr
+    assert pipe is not None
+
+    class CountingPipe:
+        """Count the complete child output without retaining its contents."""
+        def __iter__(self):
+            """Count all output, including both merged PB8 channels."""
+            for line in pipe:
+                counts["lines"] += 1
+                counts["chars"] += len(line)
+                counts[line[:3]] += 1
+                yield line
+
+        def close(self):
+            """The reader owns and releases its pipe at EOF."""
+            closed.append("pipe")
+            pipe.close()
+
+    def read_output():
+        """Record reader exceptions for assertions in the owning test thread."""
+        try:
+            PBRun_mod._ts_wrap_stderr(CountingPipe(), str(tmp_path / "unused.log"))
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            pass
+        else:
+            capacity = fcntl.fcntl(pipe.fileno(), fcntl.F_GETPIPE_SZ)
+            assert line_count * line_size >= capacity * 16
+        monkeypatch.setattr(PBRun_mod, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(PBRun_mod, "open", diagnostic_open, raising=False)
+        reader.start()
+        assert proc.wait(timeout=10) == 0
+        reader.join(timeout=5)
+        assert not reader.is_alive(), "Reader did not finish after child EOF"
+        assert not errors
+        assert counts == {"lines": line_count, "chars": line_count * line_size,
+                          "out": line_count // 2 if merged else 0,
+                          "err": line_count // 2 if merged else line_count}
+        assert opened == [True]
+        assert closed == (["pipe"] if failure == "open" else ["log", "pipe"])
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        if reader.ident is not None:
+            reader.join(timeout=5)
+        # Never close a TextIO pipe from another thread while it is reading.
+        if not reader.is_alive():
+            pipe.close()
+        assert not reader.is_alive(), "Synthetic reader could not be cleaned up"
 
 
 def test_pbrun_startup_uses_one_canonical_ini_snapshot(tmp_path, monkeypatch) -> None:
@@ -1352,17 +1591,30 @@ class TestClusterDesiredStateGate:
             return state["calls"] > 1
 
         popen_calls = []
+        thread_calls = []
+        stderr_pipe = iter(())
 
         def _popen_stub(*args, **kwargs):
             popen_calls.append((args, kwargs))
-            return SimpleNamespace(stderr=iter(()))
+            return SimpleNamespace(stderr=stderr_pipe)
 
         monkeypatch.setattr(rv7, "is_running", _is_running)
         monkeypatch.setattr(PBRun_mod.subprocess, "Popen", _popen_stub)
+        monkeypatch.setattr(
+            PBRun_mod.threading, "Thread",
+            lambda **kwargs: thread_calls.append(kwargs) or SimpleNamespace(start=lambda: None),
+        )
 
         rv7.start()
 
         assert len(popen_calls) == 1
+        assert popen_calls[0][1]["stdout"] is subprocess.DEVNULL
+        assert popen_calls[0][1]["stderr"] is subprocess.PIPE
+        assert thread_calls == [{
+            "target": PBRun_mod._ts_wrap_stderr,
+            "args": (stderr_pipe, str(Path(rv7.path) / "passivbot_err.log")),
+            "daemon": True,
+        }]
         assert rv7.cluster_blocked is False
         assert rv7.cluster_gate == "not_configured"
 

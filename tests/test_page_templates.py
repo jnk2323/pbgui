@@ -5,6 +5,7 @@ import re
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -116,6 +117,8 @@ def versioned_page_client(tmp_path, monkeypatch):
 
     app = FastAPI()
     app.dependency_overrides[require_auth] = lambda: None
+    page_paths = {path for path, _api_path, _filename in AFFECTED_PAGES}
+    page_routes = {}
     for module, prefix in (
         (optimize_v7, "/api/optimize-v7"), (optimize_v8, "/api/optimize-v8"),
         (v7_instances, "/api/v7"), (v8_instances, "/api/v8"),
@@ -123,6 +126,16 @@ def versioned_page_client(tmp_path, monkeypatch):
         (dashboard, "/api/dashboard"), (vps, ""), (vps_manager, "/api/vps-manager"),
     ):
         app.include_router(module.router, prefix=prefix)
+        for route in module.router.routes:
+            if not isinstance(route, APIRoute) or "GET" not in route.methods:
+                continue
+            full_path = prefix + route.path
+            if full_path not in page_paths:
+                continue
+            assert full_path not in page_routes, f"Duplicate GET page route: {full_path}"
+            page_routes[full_path] = route
+    assert page_routes.keys() == page_paths, f"Missing GET page routes: {sorted(page_paths - page_routes.keys())}"
+    app.state.page_routes = page_routes
     with TestClient(app) as client:
         yield client, results
 
@@ -251,7 +264,7 @@ def test_affected_page_mounts_and_complete_markers(
 def test_affected_pages_reject_unsafe_mounts(versioned_page_client, path, _api_path, _filename, root):
     """All page entry points fail closed on malformed deployment prefixes."""
     client, _ = versioned_page_client
-    route = next(route for route in client.app.routes if route.path == path)
+    route = client.app.state.page_routes[path]
     # Starlette may parse root_path as a regex before dispatch. Exercise the
     # registered renderer directly so invalid escapes reach our own boundary.
     kwargs = {field.name: field.default for field in route.dependant.query_params}

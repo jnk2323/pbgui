@@ -176,6 +176,8 @@ def test_runv8_launches_exact_cli_with_isolated_virtualenv(
     runner = _runner(tmp_path, instance)
     captured: dict[str, object] = {}
     events: list[str] = []
+    thread_calls = []
+    stdout_pipe = iter(())
     running = iter((False, False, True))
 
     class Lease:
@@ -187,7 +189,7 @@ def test_runv8_launches_exact_cli_with_isolated_virtualenv(
     def fake_popen(command, **kwargs):
         events.append("popen")
         captured.update(command=command, **kwargs)
-        return SimpleNamespace(stdout=iter(()))
+        return SimpleNamespace(stdout=stdout_pipe)
 
     monkeypatch.setattr(runner, "is_running", lambda: next(running))
     monkeypatch.setattr(
@@ -197,7 +199,10 @@ def test_runv8_launches_exact_cli_with_isolated_virtualenv(
     )
     monkeypatch.setattr(runner, "_runtime_ready", lambda: events.append("ready") or True)
     monkeypatch.setattr(pbrun.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(pbrun.threading, "Thread", lambda **_kwargs: SimpleNamespace(start=lambda: None))
+    monkeypatch.setattr(
+        pbrun.threading, "Thread",
+        lambda **kwargs: thread_calls.append(kwargs) or SimpleNamespace(start=lambda: None),
+    )
     monkeypatch.setattr(pbrun, "sleep", lambda _seconds: None)
     monkeypatch.setattr(pbrun, "_log", lambda *_args, **_kwargs: None)
 
@@ -215,6 +220,11 @@ def test_runv8_launches_exact_cli_with_isolated_virtualenv(
     assert captured["start_new_session"] is True
     assert captured["stdout"] is pbrun.subprocess.PIPE
     assert captured["stderr"] is pbrun.subprocess.STDOUT
+    assert thread_calls == [{
+        "target": pbrun._ts_wrap_stderr,
+        "args": (stdout_pipe, str(instance / "passivbot_err.log")),
+        "daemon": True,
+    }]
     assert events == ["acquire", "ready", "popen", "release"]
 
 

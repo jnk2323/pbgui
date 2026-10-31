@@ -542,13 +542,16 @@ class LoopBackend:
                 proof = historical_training_windows(record, data.get('backtest'))
                 if proof is None:
                     continue
-            metrics = opt._pareto_summary(data, 'mean')
-            if not metrics:
+            summary = opt._pareto_summary(data, 'mean')
+            if not summary:
                 continue
+            from pb8_loop_metrics import native_metric_evidence
+            suite_metrics, labels = opt._suite_metric_payload(data)
+            metric_evidence = native_metric_evidence(record, data, suite_metrics, labels, summary, job['config'])
             config = {key: copy.deepcopy(data.get(key, job['config'].get(key))) for key in job['config']}
             candidate_id = 'c_' + digest([job['operation'], artifact])[:24]
             result.append({'id': candidate_id, 'optimizer_job': job['operation'], 'config': config,
-                           'overrides': job['overrides'], 'metrics': metrics,
+                           'overrides': job['overrides'], **metric_evidence,
                            'source': {'run': source['result'], 'path': source['path'], 'modified': source['modified'], 'artifact': artifact},
                            'native_semantics': {'scoring': copy.deepcopy(data.get('optimize', {}).get('scoring')),
                                                 'objectives': copy.deepcopy((data.get('metrics') or {}).get('objectives')),
@@ -642,10 +645,9 @@ class LoopBackend:
                 if name not in metrics and name + '_usd' in metrics:
                     metrics[name] = metrics[name + '_usd']
             per_report.append(metrics)
-        keys = set.intersection(*(set(item) for item in per_report))
-        directions = {key: rule['direction'] for rule in record['rubric'] for key in rule['metrics']}
-        metrics = {key: (max(item[key] for item in per_report) if directions.get(key) == 'min'
-                         else sum(item[key] for item in per_report) / len(per_report)) for key in keys}
+        from pb8_loop_metrics import report_metric_evidence
+        metric_evidence = report_metric_evidence(record, per_report)
+        metrics = metric_evidence['metrics']
         assessment = evaluate(metrics, record['rubric'])
         assessment['achieved'] = all(evaluate(item, record['rubric'])['achieved'] for item in per_report)
         scenarios = job.get('config', {}).get('backtest', {}).get('scenarios') or []
@@ -656,7 +658,7 @@ class LoopBackend:
         assessment['achieved'] = assessment['achieved'] and complete
         assessment['hard_targets_met'] = all(evaluate(item, record['rubric'])['hard_targets_met'] for item in per_report)
         assessment['qualification'] = 'incomplete' if not complete else ('target violated' if not assessment['hard_targets_met'] else 'comparable')
-        return {'metrics': metrics, 'reports': len(reports), 'exact': True,
+        return {**metric_evidence, 'reports': len(reports), 'exact': True,
                 'per_report': per_report, 'per_report_context': contexts, 'assessment': assessment}
 
     def failed_before_data(self, record, job):

@@ -84,7 +84,6 @@ def test_shared_contract_keeps_optimizer_search_editable(record, provider):
     _, row = record
     row['settings'].update(provider=provider, scenario_enabled=False)
     candidate = copy.deepcopy(row['initial_config'])
-    candidate['optimize']['n_cpus'] = 2
     candidate['optimize']['scoring'] = ['gain']
     decision = {'variants': [{'config': candidate, 'overrides': {}}]}
     assert validate_decision(row, 'bootstrap', {'max_variants': 1}, json.dumps(decision)) == decision

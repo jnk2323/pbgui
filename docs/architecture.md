@@ -13,6 +13,8 @@
 - FastAPI serves the existing Vanilla JS frontend; JavaScript executes in the browser.
 - PB7/PB8 bot code and external provider implementations remain separate from PBGui. Do not modify their implementation or deploy changes to remote hosts without the required authorization.
 - No package installation or update runs implicitly during an AI request, login or API startup. Dependency changes belong to the existing installation/update workflow.
+- AI Loop strategy experiments cannot change worker execution settings. The reviewed `optimize.gpu` block, CPU allocation and legacy population alias are immutable provider-independent inputs, including Auto/null values. Only PBGui/worker hardware selection and explicitly reviewed user changes own runtime tuning; continuations inherit these settings from the source run, not its AI-generated optimizer variants.
+- Loop display snapshots and configuration comparisons use at most two API-owned spawned Python workers, admitting at most eight concurrent requests. Owner checks, archive integrity and the existing display projection remain mandatory; these readers do not start controllers, call AI providers or modify runs. The API coalesces overlapping reads, bounds admission/cache state and joins its report workers at shutdown without stopping independent native jobs.
 
 ## Verification and change analysis
 

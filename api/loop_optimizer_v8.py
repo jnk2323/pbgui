@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections import OrderedDict
+from concurrent.futures import Future
 import fcntl
 import math
 import os
@@ -23,7 +24,8 @@ from api.auth import SessionToken, require_auth
 from ai_chat import AIChatError, get_ai_chat_service, owner_key
 from logging_helpers import human_log as _log
 from pbgui_purefunc import PBGDIR
-from pb8_loop_controller import LoopController
+from pb8_loop_controller import LoopController, owned_thread
+from pb8_loop_report_worker import LoopReportWorker, LoopReportUnavailable, LoopSnapshotMissing
 from pb8_loop_backend import migrate_loop_bundle
 from vast_provider import VastError
 from pb8_loop_store import TERMINAL, LoopDeletionConflict, config_defaults, config_changes, digest, run_deletable, completed_round_observations
@@ -36,6 +38,8 @@ _list_cache_lock = threading.RLock()
 _LIST_CACHE_BYTES = 8 * 1024 * 1024
 _LIST_CACHE_TTL = 30
 _DETAIL_CACHE_TTL = 300
+_detail_flights = {}
+_report_worker = None
 _DISPLAY_FIELDS = frozenset({
     'id', 'owner', 'status', 'phase', 'round', 'created_at', 'started_at', 'updated_at', 'reason',
     'last_error', 'failure', 'holdout_retryable', 'stop_reason', 'continuation', 'interpretation',
@@ -271,15 +275,33 @@ class LoopHandover(BaseModel):
 
 
 def startup():
-    """Start only the replaceable API-owned loop controller."""
-    _controller.start()
+    """Own replaceable report workers and the Loop controller; native jobs remain independent."""
+    global _report_worker
+    if _report_worker is None:
+        _report_worker = LoopReportWorker()
+    try:
+        _controller.start()
+    except BaseException:
+        _report_worker.close()
+        _report_worker = None
+        raise
 
 
 async def shutdown():
     """Join controller tasks without killing detached PB8 jobs."""
-    await _controller.close()
-    _controller.store.clear_read_cache()
-    _clear_list_cache()
+    global _report_worker
+    worker = _report_worker
+    try:
+        await _controller.close()
+    finally:
+        try:
+            if worker is not None:
+                await owned_thread(worker.close)
+        finally:
+            if _report_worker is worker:
+                _report_worker = None
+            _controller.store.clear_read_cache()
+            _clear_list_cache()
 
 
 def _owner(session):
@@ -747,6 +769,7 @@ async def save_loop_config(name: str, body: LoopDefinitionSave, session: Session
                 current['settings'] = dict(current['settings'], **validated, loop_name=name, definition_name=name, source=source)
                 config, overrides, fingerprint, holdouts, comparison = prepared
                 current.update(initial_config=config, initial_overrides=overrides, fingerprint=fingerprint, holdouts=holdouts, comparison=comparison)
+                current.pop('worker_runtime', None)
                 current['control_generation'] += 1
             await asyncio.to_thread(_controller.store.update, owner, body.queue_id, refresh)
         return JSONResponse(_definition_projection(row), headers={'Cache-Control': 'no-store'})
@@ -1032,12 +1055,16 @@ async def get_loop(loop_id: str, session: SessionToken = Depends(require_auth)):
     started = time.monotonic()
     queued_at = started
     worker_started = None
+    worker_finished = None
 
     def read_detail():
         """Distinguish executor queue delay from verified report construction."""
-        nonlocal worker_started
+        nonlocal worker_started, worker_finished
         worker_started = time.monotonic()
-        return _detail_response(_owner(session), loop_id)
+        try:
+            return _detail_response(_owner(session), loop_id)
+        finally:
+            worker_finished = time.monotonic()
 
     try:
         return await asyncio.to_thread(read_detail)
@@ -1049,11 +1076,12 @@ async def get_loop(loop_id: str, session: SessionToken = Depends(require_auth)):
             _log(SERVICE, 'Slow Loop report read', level='DEBUG', meta={
                 'duration_seconds': round(elapsed, 3),
                 'queue_seconds': round((worker_started or time.monotonic()) - queued_at, 3),
-                'worker_seconds': round(time.monotonic() - worker_started, 3) if worker_started else None})
+                'worker_seconds': round((worker_finished or time.monotonic()) - worker_started, 3) if worker_started else None,
+                'delivery_seconds': round(time.monotonic() - worker_finished, 3) if worker_finished else None})
 
 
 def _detail_response(owner, loop_id):
-    """Reuse verified unchanged report bytes; build misses outside the API event loop."""
+    """Collapse overlapping owned report reads instead of rebuilding aborted requests."""
     store = _controller.store
     path = store.path(owner, loop_id)
     stamp = store._read_stamp(path)
@@ -1064,14 +1092,50 @@ def _detail_response(owner, loop_id):
             _list_cache.move_to_end(key)
             _list_cache[key] = (*cached[:3], time.monotonic() + _DETAIL_CACHE_TTL)
             return Response(content=cached[2], media_type='application/json', headers={'Cache-Control': 'no-store'})
-    row = store.read(owner, loop_id, fields=_DISPLAY_FIELDS, prefer_cached_fields=True)
-    response = JSONResponse({**projection(row), 'view_revision': row['_view_revision']}, headers={'Cache-Control': 'no-store'})
+        flight = _detail_flights.get(key)
+        leader = flight is None
+        if leader:
+            if len(_detail_flights) >= 128:
+                raise HTTPException(503, 'Loop reports are busy. Retrying automatically.')
+            flight = _detail_flights[key] = Future()
+    if not leader:
+        return Response(content=flight.result(), media_type='application/json', headers={'Cache-Control': 'no-store'})
+    try:
+        response = _build_detail_response(owner, loop_id, stamp)
+        flight.set_result(response.body)
+        return response
+    except BaseException as exc:
+        flight.set_exception(exc)
+        raise
+    finally:
+        with _list_cache_lock:
+            if _detail_flights.get(key) is flight:
+                _detail_flights.pop(key)
+
+
+def _build_detail_response(owner, loop_id, stamp):
+    """Publish one verified snapshot; a newer update cannot make its bytes a current cache hit."""
+    store = _controller.store
+    path = store.path(owner, loop_id)
+    key = (path.absolute(), _detail_response)
+    worker = _report_worker
+    if worker is None:
+        row = store.read(owner, loop_id, fields=_DISPLAY_FIELDS, prefer_cached_fields=True)
+        created_at = row['created_at']
+        response = JSONResponse({**projection(row), 'view_revision': row['_view_revision']}, headers={'Cache-Control': 'no-store'})
+    else:
+        try:
+            created_at, content = worker.build(store.root, owner, loop_id)
+        except LoopReportUnavailable as exc:
+            _log(SERVICE, 'Loop report worker unavailable', level='WARNING')
+            raise HTTPException(503, 'Loop reports are restarting. Retrying automatically.') from exc
+        response = Response(content=content, media_type='application/json', headers={'Cache-Control': 'no-store'})
     if len(response.body) <= _LIST_CACHE_BYTES // 2 and store._read_stamp(path) == stamp:
         with _list_cache_lock:
             _list_cache.pop(key, None)
             while _list_cache and (len(_list_cache) >= 128 or sum(len(item[2]) for item in _list_cache.values()) + len(response.body) > _LIST_CACHE_BYTES):
                 _list_cache.popitem(last=False)
-            _list_cache[key] = (stamp, row['created_at'], response.body, time.monotonic() + _DETAIL_CACHE_TTL)
+            _list_cache[key] = (stamp, created_at, response.body, time.monotonic() + _DETAIL_CACHE_TTL)
     return response
 
 
@@ -1104,17 +1168,33 @@ async def config_diff(loop_id: str, operation: str = Query(pattern=r'^[0-9a-f]{3
                       session: SessionToken = Depends(require_auth)):
     """Compare two snapshots within this owner's loop without exposing full configs."""
     try:
-        row = await asyncio.to_thread(_controller.store.read, _owner(session), loop_id)
-        job = next((item for item in row['jobs'] if item['operation']==operation and item['kind']=='optimizer'), None)
-        reference = next((item for item in row['jobs'] if item['operation']==baseline and item['kind']=='optimizer'), None)
-        if job is None or (baseline!='initial' and reference is None):
-            raise HTTPException(404, 'Optimizer comparison snapshot not found in this loop')
-        before = reference['config'] if reference else row['initial_config']
-        overrides = reference['overrides'] if reference else row['initial_overrides']
-        fields = _job_changes(before, job['config'], overrides, job['overrides'], limit=4096)
-        return JSONResponse({'fields':fields, 'truncated':len(fields)>=4096}, headers={'Cache-Control':'no-store'})
+        worker = _report_worker
+        if worker is None:
+            row = await asyncio.to_thread(_controller.store.read, _owner(session), loop_id,
+                                          fields={'jobs', 'initial_config', 'initial_overrides'})
+            value = _snapshot_diff(row, operation, baseline)
+        else:
+            value = await asyncio.to_thread(worker.diff, _controller.store.root, _owner(session), loop_id, operation, baseline)
+        return JSONResponse(value, headers={'Cache-Control':'no-store'})
+    except LoopSnapshotMissing as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except LoopReportUnavailable as exc:
+        _log(SERVICE, 'Loop comparison worker unavailable', level='WARNING')
+        raise HTTPException(503, 'Loop reports are busy. Retrying automatically.') from exc
     except Exception as exc:
         raise _error(exc) from exc
+
+
+def _snapshot_diff(row, operation, baseline):
+    """Apply the same bounded comparison to verified local or isolated worker inputs."""
+    job = next((item for item in row['jobs'] if item['operation']==operation and item['kind']=='optimizer'), None)
+    reference = next((item for item in row['jobs'] if item['operation']==baseline and item['kind']=='optimizer'), None)
+    if job is None or (baseline!='initial' and reference is None):
+        raise LoopSnapshotMissing('Optimizer comparison snapshot not found in this loop')
+    before = reference['config'] if reference else row['initial_config']
+    overrides = reference['overrides'] if reference else row['initial_overrides']
+    fields = _job_changes(before, job['config'], overrides, job['overrides'], limit=4096)
+    return {'fields':fields, 'truncated':len(fields)>=4096}
 
 
 @router.get('/{loop_id}/log-target')
@@ -1342,6 +1422,7 @@ async def _loop_action_owned(owner, loop_id, body):
                 if current['status'] != 'queued' or current['control_generation'] != waiting['control_generation']:
                     raise ValueError('This queue entry changed while starting')
                 current['settings'].update(settings)
+                current.pop('worker_runtime', None)
                 current.update(initial_config=config, initial_overrides=overrides, fingerprint=fingerprint, holdouts=holdouts, comparison=comparison,
                                training_exclusions=current.get('training_exclusions', []) + exclusions, status='running', started_at=time.time(), deadline=time.time() + settings['hours'] * 3600, control_generation=current['control_generation'] + 1)
             row = await asyncio.to_thread(_controller.store.update, owner, loop_id, refresh)
@@ -1475,6 +1556,8 @@ async def continue_loop(loop_id: str, body: LoopContinue, session: SessionToken 
         candidate['source'] = {'run': row['id'], 'round': body.round, 'kind': 'exact_comparison'}
         optimizer = next((job for job in row['jobs'] if job['operation'] == candidate.get('optimizer_job')), None)
         config = copy.deepcopy(optimizer['config'] if optimizer else row['initial_config'])
+        from pb8_loop_config_contract import copy_worker_settings, worker_reference
+        config = copy_worker_settings(worker_reference(row), config)
         config['bot'] = copy.deepcopy(candidate['config']['bot'])
         config['live'] = copy.deepcopy(candidate['config']['live'])
         config['backtest'] = copy.deepcopy(row['comparison'])

@@ -6,7 +6,7 @@ import subprocess
 import threading
 import sys
 from pathlib import Path, PurePath
-from time import sleep, time
+from time import monotonic, sleep, time
 import json
 import re
 from datetime import datetime
@@ -115,25 +115,57 @@ def _attach_process_stats(process: psutil.Process, run_v7: "RunV7"):
 
 
 def _ts_wrap_stderr(stderr_pipe, filepath: str):
-    """Read stderr lines and write non-log lines with UTC timestamp prefix.
+    """Drain the owned child pipe independently of best-effort diagnostics.
 
     Passivbot log lines already have a ``YYYY-MM-DDTHH:MM:SSZ`` prefix and are
     written to ``pb7/logs/`` by passivbot's own file handler — skip those.
-    Only raw stderr (tracebacks, startup tracebacks, subprocess noise) gets saved.
+    Only raw output gets saved. Retry failed diagnostic writes after 30 seconds
+    of monotonic time, without pausing pipe consumption or buffering lost lines.
     """
+    log_file = None
+    next_open_at = 0.0
     try:
-        with open(filepath, "ab") as f:
-            for raw_line in stderr_pipe:
-                line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode(errors='replace').strip()
-                if not line:
-                    continue
-                # skip passivbot log lines (already saved via its FileHandler)
-                if len(line) >= 20 and line[4] == '-' and line[7] == '-' and line[10] == 'T' and line[19] == 'Z':
-                    continue
+        for raw_line in stderr_pipe:
+            line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode(errors='replace').strip()
+            if not line:
+                continue
+            # Skip passivbot log lines (already saved via its FileHandler).
+            if len(line) >= 20 and line[4] == '-' and line[7] == '-' and line[10] == 'T' and line[19] == 'Z':
+                continue
+            if log_file is None and monotonic() < next_open_at:
+                continue
+            try:
+                if log_file is None:
+                    log_file = open(filepath, "ab", buffering=0)
                 ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                f.write(f"{ts} {line}\n".encode())
-    except Exception:
+                payload = f"{ts} {line}\n".encode()
+                if log_file.write(payload) != len(payload):
+                    raise OSError("Incomplete diagnostic log write")
+            except (OSError, ValueError):
+                # Diagnostic failures must never stop the child pipe reader.
+                next_open_at = monotonic() + 30.0
+                if log_file is not None:
+                    try:
+                        log_file.close()
+                    except (OSError, ValueError):
+                        pass
+                    log_file = None
+    except (OSError, ValueError):
+        # A terminal pipe read/decode failure cannot be retried. Preserve the
+        # quiet reader exit, but always release the exclusively owned handles.
         pass
+    finally:
+        if log_file is not None:
+            try:
+                log_file.close()
+            except (OSError, ValueError):
+                pass
+        close_pipe = getattr(stderr_pipe, "close", None)
+        if close_pipe is not None:
+            try:
+                close_pipe()
+            except (OSError, ValueError):
+                pass
 
 
 def _memory_usage_bytes(memory_info) -> int:

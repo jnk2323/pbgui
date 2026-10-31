@@ -67,6 +67,43 @@ def test_two_material_search_bounds_pass_at_threshold(upper):
     assert len(validate_exploration(row, proposed)) == 2
 
 
+def test_policy_and_correction_expose_exact_material_endpoint_thresholds():
+    """Give every provider numeric correction evidence without weakening the gate."""
+    row = search_record()
+    policy = exploration_policy(row)
+    prefix = 'long.strategy.ema_anchor.'
+    assert policy['minimum_endpoint_shifts'][prefix + 'ema_span_0'] == 355
+    assert policy['minimum_endpoint_shifts'][prefix + 'entry_double_down_factor'] == .5
+    proposed = copy.deepcopy(row['initial_config'])
+    bounds = proposed['optimize']['bounds']['long']['strategy']['ema_anchor']
+    bounds['ema_span_0'][1] = 1795
+    bounds['ema_span_1'][1] = 1450
+    with pytest.raises(ValueError) as error:
+        validate_exploration(row, proposed)
+    message = str(error.value)
+    assert 'found 1 material bound changes' in message
+    assert 'ema_span_0: 355/355' in message[:500]
+    assert 'ema_span_1: 10/355' in message[:500]
+    assert row['initial_config']['optimize']['bounds']['long']['strategy']['ema_anchor']['ema_span_0'][1] == 1440
+
+
+@pytest.mark.parametrize('upper,accepted', [(.08, True), (.079999999, False)])
+def test_decimal_endpoint_threshold_honors_exact_quarter_width(upper, accepted):
+    """Floating point noise must not reject an exact 25% shift or allow a smaller one."""
+    row = search_record()
+    row['initial_config']['optimize']['bounds']['long']['strategy']['ema_anchor']['entry_double_down_factor'] = [.03, .07]
+    row['jobs'][0]['config'] = copy.deepcopy(row['initial_config'])
+    proposed = copy.deepcopy(row['initial_config'])
+    bounds = proposed['optimize']['bounds']['long']['strategy']['ema_anchor']
+    bounds['ema_span_0'][1] = 1795
+    bounds['entry_double_down_factor'][1] = upper
+    if accepted:
+        assert len(validate_exploration(row, proposed)) == 2
+    else:
+        with pytest.raises(ValueError, match='found 1 material bound changes'):
+            validate_exploration(row, proposed)
+
+
 def test_actual_last_input_is_reference_and_fixed_bounds_do_not_count():
     """Compare against execution, never the incumbent, initial config or future job."""
     row = search_record()

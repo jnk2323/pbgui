@@ -1,5 +1,6 @@
 """Template searches expose the full scoring catalog without forcing per-round choices."""
 import copy
+import json
 
 import pytest
 
@@ -8,6 +9,7 @@ from ai_loop_request import bind_request
 from pb8_loop_exploration import exploration_policy, validate_exploration
 from tests.test_ai_loop_objectives import reviewed_run, RUBRIC
 from tests.test_ai_loop_windows import request
+from tests.test_pb8_loop_optimizer import record
 from vast_config_validation import METRICS, REDUCERS
 
 
@@ -94,3 +96,58 @@ def test_coverage_informs_without_prescribing_next_experiment(tmp_path):
     assert not coverage['required']
     assert not coverage['require_untested_metric']
     assert not coverage['require_new_optional_limits']
+
+
+@pytest.mark.parametrize('execution', ['gpu', 'vast'])
+@pytest.mark.parametrize('experiment', ['bounds', 'seed', 'repeat', 'population'])
+def test_legacy_continuation_requires_material_search_change(tmp_path, execution, experiment):
+    """A continuation cannot silently weaken broad exploration into small edits."""
+    row = search_run(tmp_path)
+    row['settings'].update(execution=execution, source={})
+    row['continuation'] = {'parent': '1' * 32, 'additional_runs': 25}
+    row.update(round=10, stagnation=8)
+    candidate = copy.deepcopy(row['jobs'][-1]['config'])
+    if experiment == 'bounds':
+        candidate['optimize']['bounds']['long']['risk']['first'][1] = 10.5
+    elif experiment == 'seed':
+        candidate['optimize']['seed'] = 42
+    elif experiment == 'population':
+        candidate['optimize'].setdefault('gpu', {})['population_size'] = 1024
+    before = copy.deepcopy(row)
+    assert exploration_policy(row)['mode'] == 'broad'
+    with pytest.raises(ValueError, match='Broad exploration requires'):
+        validate_exploration(row, candidate, stagnation_after=9)
+    candidate['optimize']['limits'][0]['value'] = .6
+    with pytest.raises(ValueError, match='hard user-goal filter'):
+        validate_exploration(row, candidate)
+    assert row == before
+
+
+@pytest.mark.parametrize('provider', ['chatgpt', 'claude-code', 'opencode-go', 'opencode-zen'])
+def test_legacy_gpu_provider_gate_requires_material_change_and_protects_dates(record, provider):
+    """All adapters reject tiny follow-ups while accepting a different objective set."""
+    from pb8_loop_ai_v2 import validate_decision
+    from tests.test_pb8_loop_optimizer import valid_gpu_config
+    _, row = record
+    row['settings'].update(provider=provider, execution='gpu', source={})
+    row['initial_config'] = valid_gpu_config()
+    row['jobs'] = [{'kind': 'optimizer', 'operation': 'previous', 'round': 10,
+                    'config': copy.deepcopy(row['initial_config'])}]
+    evidence = {'winner_options': {'winner': {}}, 'remaining_rounds': 14,
+                'remaining_runs': 14, 'free_slots': 1, 'exploration_policy': exploration_policy(row)}
+    decision = {'winner_operation': 'winner', 'reason': 'Retain the independently qualified incumbent',
+                'finish': False, 'variants': [{'config': copy.deepcopy(row['initial_config']),
+                'overrides': {}, 'reason': 'Repeat the promising scoring with a fresh population to test repeatability'}]}
+    with pytest.raises(ValueError, match='Broad exploration requires'):
+        validate_decision(row, 'evaluate', evidence, json.dumps(decision))
+    decision['variants'][0]['config']['optimize']['scoring'].append(
+        {'metric': 'drawdown_worst_strategy_eq', 'goal': 'min', 'reducer': 'max'})
+    decision['variants'][0]['reason'] = 'Test growth against worst-window risk on a new Pareto front'
+    assert validate_decision(row, 'evaluate', evidence, json.dumps(decision))['variants']
+    decision['variants'][0]['reason'] = ''
+    with pytest.raises(ValueError, match='hypothesis'):
+        validate_decision(row, 'evaluate', evidence, json.dumps(decision))
+    decision['variants'][0]['reason'] = 'Keep the same training window'
+    decision['variants'][0]['config']['backtest']['end_date'] = '2030-01-01'
+    with pytest.raises(ValueError, match='fixed Loop configuration contract'):
+        validate_decision(row, 'evaluate', evidence, json.dumps(decision))

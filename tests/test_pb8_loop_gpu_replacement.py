@@ -1638,6 +1638,7 @@ def test_stop_publishes_last_verified_results_without_hiding_execution_failure(e
             source = root / 'optimize_results/fixture'
             source.mkdir(parents=True)
             (source / 'all_results.bin').write_bytes(msgpack.packb({'metrics': {'gain': 1}}))
+            write_json(source / 'pareto/fixture.json', {'metrics': {'gain': 1}})
             if final:
                 write_json(root / 'finished.json', dict(cancelled=outcome == 'cancelled',
                     exit_code=1 if outcome == 'failed' else 130 if outcome == 'cancelled' else 0))

@@ -20,7 +20,8 @@ def test_recovery_feedback_is_immediate_and_scoped(outcome):
         'ended':False, 'created_at':1000, 'updated_at':1001, 'settings':{'config_name':'fixture',
         'execution':'cpu', 'historical_advice':True, 'ai_decision_token_limit':1000, 'ai_decision_usd_limit':1},
         'jobs':[], 'observer_jobs':[], 'history':[], 'cycles':[], 'rubric':[], 'best':None,
-        'fingerprint':{}, 'ai_pause':{'reason':'evidence_recovery','message':'Fixture paused'},
+        'fingerprint':{}, 'reason':'Historical evidence recovery error',
+        'ai_pause':{'reason':'evidence_recovery','message':'Fixture paused'},
         'has_interrupted_ai':outcome=='cancel_interrupted'}
     preview = {'context':1000000, 'native_archive':{'effective':500}, 'streaming':True,
                'paid':outcome=='cancel_paid', 'maximum_decisions':5, 'maximum_attempts':5}
@@ -68,6 +69,10 @@ def test_recovery_feedback_is_immediate_and_scoped(outcome):
         except Exception:
             pytest.fail(str(errors)+'; '+page.locator('#loop-report-body').inner_text()+'; '+page.locator('#loops-queue-message').inner_text())
         field = form.locator('input[type=number]').first
+        summary = page.locator('#loop-report-body table').first
+        assert 'Search status' in summary.inner_text()
+        assert 'Fixture paused' in summary.inner_text()
+        assert 'Search stopped' not in summary.inner_text()
         field.fill('2000')
         status = form.locator('[data-recovery-status]')
         control = form.locator('[data-recovery-action='+('preview' if outcome in {'success','preview_error','selection_error'} else 'resume')+']')
@@ -121,6 +126,8 @@ def test_recovery_feedback_is_immediate_and_scoped(outcome):
                         actions[0].fulfill(json=row)
                         page.wait_for_function("!document.querySelector('[data-loop-recovery]')")
                         assert 'running' in page.locator('#loop-report-body').inner_text()
+                        assert 'Search status' in summary.inner_text()
+                        assert 'Historical evidence recovery error' not in summary.inner_text()
         if outcome!='success':
             assert field.input_value()=='2000' and field.is_enabled()
             assert control.is_enabled()

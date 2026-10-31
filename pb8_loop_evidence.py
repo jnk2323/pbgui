@@ -181,8 +181,12 @@ def required_content(content):
             return [walk(item) for item in value]
         if not isinstance(value, dict):
             return value
-        if key in {'metrics', 'per_report'}:
+        if key in {'metrics', 'per_report', 'metric_statistics'}:
             return {name: copy.deepcopy(item) for name, item in value.items() if name in relevant}
+        if key == 'metric_basis':
+            return {name: ({metric: reducer for metric, reducer in item.items() if metric in relevant}
+                           if name in {'reducers', 'unavailable'} and isinstance(item, dict) else copy.deepcopy(item))
+                    for name, item in value.items()}
         result = {}
         for name, item in value.items():
             if name == 'native_semantics' or (stage == 'select' and name == 'overrides'):
@@ -226,6 +230,7 @@ def required_content(content):
             unique = []
             for projected, original in zip(candidates, originals):
                 signature = sha([original.get('config'), original.get('overrides'), original.get('metrics'),
+                                 original.get('metric_statistics'), original.get('metric_basis'),
                                  raw.get('comparison'), original.get('comparison_fingerprint')])
                 alias = {key: copy.deepcopy(original.get(key)) for key in ('id', 'optimizer_job', 'source')}
                 if signature in groups:

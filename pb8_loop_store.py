@@ -439,6 +439,8 @@ def validate_change(record, config, overrides):
         validate_template_rubric(record, config, record.get('rubric'))
     if not all(isinstance(config.get(key), dict) for key in ('backtest', 'bot', 'live', 'optimize')):
         raise ValueError('A complete PB8 optimizer configuration is required')
+    from pb8_loop_config_contract import validate_worker_settings
+    validate_worker_settings(record, config)
     from ai_loop_search_limits import exposure_ceiling, validate_exposure_ceiling
     validate_exposure_ceiling(config, exposure_ceiling(record['settings']))
     validate_hsl_policy(record, config, overrides)
