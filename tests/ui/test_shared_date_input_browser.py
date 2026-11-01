@@ -30,6 +30,7 @@ def test_editors_share_overwrite_and_calendar(filename, renderer):
         page = browser.new_page()
         page.set_content('<main></main><input id="other">')
         page.add_script_tag(path=str(ROOT / 'frontend/js/date_overwrite.js'))
+        page.add_script_tag(path=str(ROOT / 'frontend/js/ohlcv_start_dates.js'))
         page.evaluate('''() => {
             window.fmtGroupSpan = (id, label, input) => input;
             window.__dp = {show(id, button) { window.calendarTarget = [id, button.dataset.dp]; }};
@@ -63,6 +64,7 @@ def test_shared_renderer_escapes_values_and_ids():
         page = browser.new_page()
         page.set_content('<main></main>')
         page.add_script_tag(path=str(ROOT / 'frontend/js/date_overwrite.js'))
+        page.add_script_tag(path=str(ROOT / 'frontend/js/ohlcv_start_dates.js'))
         value = '\"><img src=x onerror="window.injected=true">'
         page.evaluate('value => document.querySelector("main").innerHTML = PBGuiDateInput.render(value, value)', value)
         assert page.locator('img').count() == 0

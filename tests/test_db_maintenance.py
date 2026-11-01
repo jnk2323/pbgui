@@ -67,7 +67,7 @@ def tools(tmp_path, monkeypatch):
 
     names = {"_ensure_schema", "_clean_users", "_local_db_path", "_data_dir", "_target_db_paths_local",
              "_connect_bundle", "_close_bundle", "_table_exists", "_table_columns", "_placeholders",
-             "_row_exists", "_copy_spec_rows", "copy_user_rows", "delete_user_rows", "_maintain_target",
+             "_row_exists", "_copy_spec_rows", "copy_user_rows", "delete_user_rows", "_delete_online_rows", "_maintain_target",
              "_install_db_bundle", "restart_block_reason", "_assert_maintenance_available", "_target_id",
              "cleanup_run", "copy_users_run", "restore_backups_run", "copy_database_run", "recover_maintenance",
              "_validate_backup_name", "_run_remote_python", "_upload_source_snapshots", "_remove_remote_snapshots"}
@@ -221,7 +221,7 @@ def test_cancel_after_first_install_rolls_back_absent_second_db(tmp_path, tools,
     assert recovery_record(tmp_path) is None
 
 
-@pytest.mark.parametrize("kind", ["cleanup", "copy"])
+@pytest.mark.parametrize("kind", ["copy"])
 def test_row_maintenance_excludes_shared_writer_before_stop(tmp_path, tools, kind):
     """Admission failure has no service, backup, or row-deletion side effects."""
     live = _bundle(tools, tmp_path / "data", 1)
@@ -235,14 +235,17 @@ def test_row_maintenance_excludes_shared_writer_before_stop(tmp_path, tools, kin
 
 @pytest.mark.parametrize("kind", ["cleanup", "copy"])
 def test_rows_backup_and_all_commits_share_one_owner(tmp_path, tools, kind):
-    """EX admission covers backup, every table, and close without nested SH acquisition."""
+    """Restore admission is excluded throughout backup, table changes and close."""
     live = _bundle(tools, tmp_path / "data", 1)
     source = _bundle(tools, tmp_path / "source", 2)
 
     def phase(*args):
         """Attempt a competing cooperative writer after each table commit."""
         with pytest.raises(DatabaseBusyError):
-            acquire_database_lock(tmp_path)
+            acquire_database_lock(tmp_path, exclusive=kind == "cleanup")
+        if kind == "cleanup":
+            with acquire_database_lock(tmp_path):
+                pass
 
     progress = SimpleNamespace(set_current=phase, advance=phase)
     result = maintenance.run(tmp_path, _request(source if kind == "copy" else {}, kind=kind,
@@ -373,7 +376,7 @@ def test_routes_return_busy_before_queueing(tmp_path, tools, handler):
     """Known admission conflicts return HTTP 409, not a seemingly accepted operation."""
     payload = SimpleNamespace(target="local", source="other", users=["alice"], mode="all", cutoff_ms=None,
                               backups=["old-pbgui.db"])
-    with acquire_database_lock(tmp_path):
+    with acquire_database_lock(tmp_path, exclusive=True):
         with pytest.raises(HTTPException) as busy:
             asyncio.run(getattr(tools, handler)(payload, session=object()))
     assert busy.value.status_code == 409

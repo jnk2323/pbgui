@@ -13,8 +13,8 @@ Vor jedem manuellen Datenbank-Wartungsschreibvorgang wird ein Backup erstellt. D
 - **local** bezeichnet die PBGui-Installation, auf der die Seite geöffnet ist.
 - Remote-Ziele sind bekannte Master-Nodes aus dem VPS Manager.
 - Quelle und Ziel müssen bei Kopier- und Sync-Aktionen unterschiedlich sein.
-- Aktive PBData-Schreibvorgänge können eine Aktion blockieren, wenn das Ziel nicht sicher geändert werden kann.
-- Manuelles Cleanup, User-Copy, vollstaendige DB-Kopie und Restore reservieren das Ziel exklusiv, bevor der PBData-Stopp bestaetigt und Backups erstellt werden. Ein fehlgeschlagener Stopp oder unbekannter Dienstzustand blockiert die Aktion und gilt nicht als bereits gestoppter Writer.
+- Bei Cleanup läuft PBData weiter. Die Aktion erstellt Online-Backups aus stabilen Lesesnapshots und löscht in Paketen von höchstens 250 Zeilen mit einer kurzen Pause dazwischen. Auf jede Schreibsperre wartet sie bis zu 30 Sekunden. Normale Scan- und Sync-Leases verhindern den Start nicht; vollständige Restores und der Austausch von Datenbanken bleiben ausgeschlossen.
+- User-Copy, vollstaendige DB-Kopie und Restore reservieren das Ziel exklusiv, bevor der PBData-Stopp bestaetigt und Backups erstellt werden. Ein fehlgeschlagener Stopp oder unbekannter Dienstzustand blockiert diese Aktionen und gilt nicht als bereits gestoppter Writer.
 - Restore aendert bestehende SQLite-Inhalte direkt und erhaelt offene Verbindungen, Dateiidentitaet und WAL-Verarbeitung. PBData startet erst nach einem konsistenten Ergebnis oder erfolgreichem Rollback erneut, und nur wenn es vorher lief.
 - Remote-Wartung verwendet einen zielseitigen Worker mit einer durchgehenden Lease. Alte Remote-Checkouts oder API-Prozesse ohne Writer-Guards werden abgewiesen. Remote-PBGui muss vor einem neuen Versuch ausdruecklich aktualisiert und neu gestartet werden; DB Tools installiert keine Updates automatisch.
 - Längere Aktionen erscheinen im Fortschrittsbereich und können zusätzlich im DB-Tools-Logviewer geprüft werden.
@@ -33,7 +33,13 @@ Cleanup entfernt Zeilen ausgewählter Benutzer aus `pbgui.db` und `pbgui_trades.
 
 Der Datumsmodus entfernt Zeilen vor dem UTC-Stichtag aus Tabellen mit Zeitstempelspalten. Nach Änderungen an Ziel, Modus, Datum oder Auswahl ist eine neue Vorschau erforderlich.
 
-Die Zielreservierung umfasst Backup, jeden Tabellen-Commit und das Schliessen der Verbindungen. Schlaegt Cleanup oder Copy fehl, versucht die Aktion das gesamte vorherige Ziel-Bundle wiederherzustellen, bevor Writer weiterarbeiten duerfen.
+Cleanup löscht nur die exakt ausgewählten Benutzernamen aus allen unterstützten Benutzertabellen. Verarbeitet werden die in den vollständigen Backups gesicherten Zeilen; eine Live-Zeile wird nur gelöscht, wenn ihr Inhalt weiterhin der gesicherten Zeile entspricht. Nach dem jeweiligen Snapshot hinzugefügte oder geänderte Daten bleiben erhalten. Ein neues Archivformat oder ein eigener Wiederherstellungsablauf ist nicht erforderlich; die Backups stehen weiterhin im Backup Manager bereit.
+
+Bei vollständigem Benutzer-Cleanup werden Scan-Checkpoints anhand von Benutzer und Exchange zurückgesetzt, auch wenn ihr Zeitstempel nach dem Backup fortgeschritten ist. Bei datumsbegrenztem Cleanup bleibt der vollständige Vergleich erhalten. Eine laufende Erfassung kann erneut Checkpoints und Daten anlegen; Cleanup garantiert bei fortlaufender Erfassung keinen historischen Neuimport.
+
+Jedes Paket wird einzeln bestätigt. Bei einem Abbruch enthält das Ergebnis `cancelled: true`, die tatsächliche Löschzahl und die erhaltenen Backups; bestätigte Pakete bleiben gelöscht. Ein fehlerhaftes Paket wird zurückgerollt, frühere Pakete bleiben bestätigt und die Fehlermeldung nennt deren Löschzahl. Ein erneutes Cleanup verarbeitet verbleibende Daten. Cleanup überschreibt keine parallelen Schreibvorgänge durch einen vollständigen Restore. Scheitert die Backup-Vorbereitung oder wurde keine Zeile gelöscht, werden die Snapshots dieses Versuchs entfernt; Backups früherer Versuche bleiben unberührt. User-Copy verwendet weiterhin exklusive Wartung mit Wiederherstellung des Datenbank-Bundles bei Fehlern.
+
+Cleanup entfernt gespeicherte Daten; es deaktiviert weder die Datenerfassung eines Kontos noch Sync-Jobs. Für weiterhin erfasste oder synchronisierte Konten können erneut Daten eintreffen.
 
 ## Copy User Data
 

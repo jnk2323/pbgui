@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script src="/app/js/ohlcv_start_dates.js?v=3"></script>
 <script>
 (function () {
   var params = new URLSearchParams(window.location.search);
@@ -5009,23 +5010,9 @@ function normalizeOptimizeDateOnlyValue(value) {
 }
 
 function fieldOptimizeStartDate2(id, label, value, tip, span) {
-  var dateValue = normalizeOptimizeDateOnlyValue(value || '');
-  var inputHtml = '<div>' +
-    '<div style="display:flex;gap:3px;align-items:center">' +
-      PBGuiDateInput.render(id, dateValue) +
-      '<button type="button" class="act-btn opted-ohlcv-start-btn" style="padding:0 5px;white-space:nowrap" onclick="setOptimizeStartDateFromOhlcv(\'earliest\',this)" title="Set to the earliest selected market with OHLCV coverage" aria-label="Set earliest OHLCV start date">1st</button>' +
-      '<button type="button" class="act-btn opted-ohlcv-start-btn" style="padding:0 5px;white-space:nowrap" onclick="setOptimizeStartDateFromOhlcv(\'all_markets\',this)" title="Set to the first date available for every selected exchange and coin" aria-label="Set common OHLCV start date">All</button>' +
-    '</div>' +
-    '<div id="opted-ohlcv-start-status" role="status" aria-live="polite" style="margin-top:4px;font-size:var(--fs-xs);overflow-wrap:anywhere"></div>' +
-    '<div id="opted-ohlcv-start-progress" style="display:none;margin-top:4px">' +
-      '<div style="display:flex;align-items:center;gap:4px">' +
-        '<div style="height:5px;flex:1;overflow:hidden;border-radius:3px;background:var(--bg3)"><div id="opted-ohlcv-start-progress-fill" style="height:100%;width:0;background:var(--accent);transition:width .2s"></div></div>' +
-        '<button type="button" class="act-btn act-btn-danger" id="opted-ohlcv-start-stop" style="padding:0 5px" onclick="stopOptimizeStartDateLookup(false)">Stop</button>' +
-      '</div>' +
-      '<div id="opted-ohlcv-start-progress-label" style="margin-top:2px;font-size:var(--fs-xs);color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="">Preparing lookup...</div>' +
-    '</div>' +
-  '</div>';
-  return fmtGroupSpan(id, label, inputHtml, tip, span || 1);
+  return PBGuiOhlcvStartDates.renderField(id, label, normalizeOptimizeDateOnlyValue(value), tip, span, {
+    prefix:'opted', startAction:'setOptimizeStartDateFromOhlcv', stopAction:'stopOptimizeStartDateLookup', group:fmtGroupSpan
+  });
 }
 
 function cfgDateValueToMs(value) {
@@ -5533,6 +5520,9 @@ function buildHttpError(response, text) {
         detail = parsed.detail;
         if (typeof detail === 'string' && detail.trim()) {
           message = detail.trim();
+        } else if (Array.isArray(detail)) {
+          message = detail.map(function(item) { return item && typeof item.msg === 'string' ? item.msg : ''; })
+            .filter(Boolean).join('; ') || ('HTTP ' + response.status);
         } else if (detail && typeof detail === 'object' && typeof detail.message === 'string' && detail.message.trim()) {
           message = detail.message.trim();
         }
@@ -11345,6 +11335,23 @@ var _optOhlcvPreflightController = null;
 var _optOhlcvStartDateRequestId = 0;
 var _optOhlcvStartDateRun = null;
 var _optOhlcvStartDatePollTimer = null;
+var _optStartDateController = null;
+function getOptimizeStartDateController() {
+  if (!_optStartDateController) _optStartDateController = PBGuiOhlcvStartDates.create({
+    state: {
+      get run() { return _optOhlcvStartDateRun; }, set run(value) { _optOhlcvStartDateRun = value; },
+      get timer() { return _optOhlcvStartDatePollTimer; }, set timer(value) { _optOhlcvStartDatePollTimer = value; },
+      get requestId() { return _optOhlcvStartDateRequestId; }, set requestId(value) { _optOhlcvStartDateRequestId = value; }
+    },
+    isV8:function() { return optimizeEditorAdapter.isV8; }, visible:editorVisible,
+    fetch:apiFetch, collect:collectOptimizeStartLookupConfig, signature:optimizeOhlcvStartLookupSignature,
+    apply:applyOptimizeStartDateResult, status:setOptimizeStartDateStatus,
+    running:setOptimizeStartDateControlsRunning, progress:renderOptimizeStartDateProgress,
+    clearProgress:function() { var node=el('opted-ohlcv-start-progress'); if(node) node.style.display='none'; }
+  });
+  return _optStartDateController;
+}
+
 
 async function getOptimizeOhlcvPreflightPayload() {
   cancelOptimizeEditorSync();
@@ -11433,28 +11440,11 @@ function renderOptimizeStartDateProgress(payload) {
 }
 
 function clearOptimizeStartDateProgress() {
-  if (_optOhlcvStartDateRun && _optOhlcvStartDateRun.stopTimer) {
-    window.clearTimeout(_optOhlcvStartDateRun.stopTimer);
-    _optOhlcvStartDateRun.stopTimer = null;
-  }
-  if (_optOhlcvStartDatePollTimer) {
-    window.clearTimeout(_optOhlcvStartDatePollTimer);
-    _optOhlcvStartDatePollTimer = null;
-  }
-  _optOhlcvStartDateRun = null;
-  setOptimizeStartDateControlsRunning(false);
-  var container = el('opted-ohlcv-start-progress');
-  if (container) container.style.display = 'none';
+  return getOptimizeStartDateController().clear();
 }
 
 function resetOptimizeStartDateLookup() {
-  _optOhlcvStartDateRequestId += 1;
-  var run = _optOhlcvStartDateRun;
-  clearOptimizeStartDateProgress();
-  setOptimizeStartDateStatus('');
-  if (run && run.jobId) {
-    apiFetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId), {method: 'DELETE'}).catch(function() {});
-  }
+  return getOptimizeStartDateController().reset();
 }
 
 async function applyOptimizeStartDateResult(run, response) {
@@ -11490,122 +11480,23 @@ async function applyOptimizeStartDateResult(run, response) {
 }
 
 function scheduleOptimizeStartDatePoll(delayMs) {
-  if (_optOhlcvStartDatePollTimer) window.clearTimeout(_optOhlcvStartDatePollTimer);
-  _optOhlcvStartDatePollTimer = window.setTimeout(refreshOptimizeStartDateLookup, Math.max(100, delayMs || 500));
+  return getOptimizeStartDateController().schedule(delayMs);
 }
 
 function optimizeStartDateRequestDeadline(promise, ms) {
-  var timer;
-  return Promise.race([promise, new Promise(function(resolve, reject) {
-    timer = window.setTimeout(function() { reject(new Error('Request timed out')); }, ms);
-  })]).finally(function() { window.clearTimeout(timer); });
+  return getOptimizeStartDateController().deadline(promise, ms);
 }
 
-async function refreshOptimizeStartDateLookup() {
-  var run = _optOhlcvStartDateRun;
-  if (!run || !run.jobId) return;
-  try {
-    var response = await optimizeStartDateRequestDeadline(apiFetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId)), 10000);
-    if (_optOhlcvStartDateRun !== run) return;
-    if (run.stopping) {
-      if (response.status === 'completed' || response.status === 'error' || response.status === 'stopped') {
-        if (!run.silentStop) setOptimizeStartDateStatus('Lookup stopped. Retry when ready.');
-        clearOptimizeStartDateProgress();
-      } else scheduleOptimizeStartDatePoll(250);
-      return;
-    }
-    renderOptimizeStartDateProgress(response);
-    if (response.status === 'completed') {
-      await applyOptimizeStartDateResult(run, response);
-      if (_optOhlcvStartDateRun === run && !run.stopping) clearOptimizeStartDateProgress();
-      return;
-    }
-    if (response.status === 'error' || response.status === 'stopped') {
-      setOptimizeStartDateStatus(response.status === 'error'
-        ? 'Lookup unsuccessful: ' + (response.error || 'PB8 lookup failed.') + ' Retry after correcting the problem.'
-        : 'Lookup stopped. Retry when ready.', response.status === 'error' ? 'error' : '');
-      clearOptimizeStartDateProgress();
-      return;
-    }
-    scheduleOptimizeStartDatePoll(500);
-  } catch (error) {
-    if (_optOhlcvStartDateRun !== run) return;
-    setOptimizeStartDateStatus('Lookup unsuccessful: request failed or timed out. The backend may still be stopping. Retry.', 'error');
-    apiFetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId), {method: 'DELETE'}).catch(function() {});
-    clearOptimizeStartDateProgress();
-  }
+function refreshOptimizeStartDateLookup() {
+  return getOptimizeStartDateController().refresh();
 }
 
-async function setOptimizeStartDateFromOhlcv(mode, triggerButton) {
-  if (!optimizeEditorAdapter.isV8 || _optOhlcvStartDateRun) return;
-  if ((mode !== 'earliest' && mode !== 'all_markets') || !triggerButton) return;
-  var requestId = ++_optOhlcvStartDateRequestId;
-  var run = {jobId: null, mode: mode, requestId: requestId, silentStop: false};
-  _optOhlcvStartDateRun = run;
-  setOptimizeStartDateStatus('');
-  setOptimizeStartDateControlsRunning(true);
-  renderOptimizeStartDateProgress({status: 'queued', progress: {percent: 0, message: 'Starting PB8 lookup...'}});
-  try {
-    var config = await collectOptimizeStartLookupConfig();
-    if (_optOhlcvStartDateRun !== run) return;
-    run.signature = optimizeOhlcvStartLookupSignature(config);
-    var post = apiFetch('/ohlcv-start-dates', {method: 'POST', body: JSON.stringify({ config: config })});
-    // A late POST can still create a job after the UI times out or is closed.
-    post.then(function(response) {
-      if ((_optOhlcvStartDateRun !== run || run.stopping || !editorVisible()) && response && response.job_id) {
-        apiFetch('/ohlcv-start-dates/' + encodeURIComponent(response.job_id), {method: 'DELETE'}).catch(function() {});
-      }
-    }).catch(function() {});
-    var response = await optimizeStartDateRequestDeadline(post, 10000);
-    if (_optOhlcvStartDateRun !== run || run.stopping || !editorVisible()) return;
-    if (!response || !response.job_id) throw new Error('Lookup returned no job ID. Retry.');
-    run.jobId = response.job_id;
-    renderOptimizeStartDateProgress(response);
-    scheduleOptimizeStartDatePoll(100);
-  } catch (error) {
-    if (_optOhlcvStartDateRun !== run) return;
-    var message = error && error.message === 'Request timed out'
-      ? 'Request timed out before a job ID was received. The backend may still be starting or stopping; retry.'
-      : (error && error.message ? error.message : 'Lookup failed. Retry.');
-    setOptimizeStartDateStatus('Lookup unsuccessful: ' + message, 'error');
-    clearOptimizeStartDateProgress();
-  }
+function setOptimizeStartDateFromOhlcv(mode, triggerButton) {
+  return getOptimizeStartDateController().start(mode, triggerButton);
 }
 
-async function stopOptimizeStartDateLookup(silent) {
-  var run = _optOhlcvStartDateRun;
-  if (!run || run.stopping) return;
-  run.silentStop = !!silent;
-  run.stopping = true;
-  if (!run.jobId) {
-    if (!silent) setOptimizeStartDateStatus('Lookup stopped while starting. The backend may still be stopping. Retry when ready.');
-    clearOptimizeStartDateProgress();
-    return;
-  }
-  run.stopTimer = window.setTimeout(function () {
-    if (_optOhlcvStartDateRun !== run) return;
-    if (!run.silentStop) setOptimizeStartDateStatus('Timed out waiting for lookup to stop. The backend may still be stopping.', 'error');
-    clearOptimizeStartDateProgress();
-  }, 10000);
-  if (_optOhlcvStartDatePollTimer) {
-    window.clearTimeout(_optOhlcvStartDatePollTimer);
-    _optOhlcvStartDatePollTimer = null;
-  }
-  renderOptimizeStartDateProgress({status: 'stopping', stop_requested: true,
-    progress: Object.assign({}, run.lastProgress || {}, {message: 'Stopping PB8 lookup...'})});
-  try {
-    var response = await apiFetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId), {method: 'DELETE'});
-    if (_optOhlcvStartDateRun !== run) return;
-    renderOptimizeStartDateProgress(response);
-    if (response.status === 'completed' || response.status === 'error' || response.status === 'stopped') {
-      if (!run.silentStop) setOptimizeStartDateStatus('Lookup stopped. Retry when ready.');
-      clearOptimizeStartDateProgress();
-    } else scheduleOptimizeStartDatePoll(250);
-  } catch (error) {
-    if (_optOhlcvStartDateRun !== run) return;
-    if (!run.silentStop) setOptimizeStartDateStatus('Could not stop lookup. The backend may still be stopping.', 'error');
-    clearOptimizeStartDateProgress();
-  }
+function stopOptimizeStartDateLookup(silent) {
+  return getOptimizeStartDateController().stop(silent);
 }
 
 function initOptimizeOhlcvPreflightController() {

@@ -475,7 +475,7 @@ def restore_sqlite_backup(
                     raise InvalidBackupError("SQLite snapshot validation/restore failed") from exc
 
 
-def backup_sqlite_database(source: Path, destination: Path, *, timeout: float = 30.0) -> None:
+def backup_sqlite_database(source: Path, destination: Path, *, timeout: float = 30.0, stable_snapshot: bool = False) -> None:
     """Publish a coherent WAL-aware snapshot at a NEW path without clobbering it."""
     check = _deadline(timeout)
     source, destination = map(_path, (source, destination))
@@ -486,6 +486,11 @@ def backup_sqlite_database(source: Path, destination: Path, *, timeout: float = 
             fd = os.open(staged, os.O_RDWR | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE)
             os.close(fd)
             with closing(_connect(source, "ro")) as live, closing(_connect(staged, "rw")) as snapshot:
+                if stable_snapshot:
+                    # Pin one WAL read snapshot so foreign commits cannot restart
+                    # the incremental backup. This never upgrades to a writer.
+                    live.execute("BEGIN")
+                    live.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
                 _copy_database(live, snapshot, check)
             with staged.open("rb") as completed:
                 os.fsync(completed.fileno())

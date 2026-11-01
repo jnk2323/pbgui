@@ -96,8 +96,9 @@ class OperationProgress:
 
     def finish(self, result: dict[str, Any]) -> None:
         self.status = "done"
-        self.completed = self.total
-        self.current = "Completed"
+        if not result.get("cancelled"):
+            self.completed = self.total
+        self.current = "Cancelled; completed batches retained" if result.get("cancelled") else "Completed"
         self.result = result
         self.updated_at = datetime.now(timezone.utc).isoformat()
 
@@ -2248,6 +2249,74 @@ async def sync_user_rows_incremental(
     }
 
 
+def _delete_online_rows(db_paths, users, cutoff_ms, operation, owner):
+    """Delete bounded batches only while each row still matches its full backup."""
+    from db_maintenance import MaintenanceCancelled
+
+    deleted = {}
+    cancelled = False
+    conns = _connect_bundle({name: db_paths[name] for name in owner.snapshots})
+    try:
+        for spec in TABLE_SPECS:
+            key = f"{spec.db_name}:{spec.table}"
+            deleted[key] = 0
+            owner.check()
+            if spec.db_name not in conns or (cutoff_ms is not None and not spec.timestamp_col):
+                continue
+            snapshot = owner.snapshots[spec.db_name]
+            with closing(sqlite3.connect(snapshot.as_uri() + "?mode=ro&immutable=1", uri=True)) as saved:
+                if not _table_exists(saved, spec.table):
+                    continue
+                columns = _table_columns(saved, spec.table)
+                params = list(users)
+                query = f'SELECT rowid, * FROM "{spec.table}" WHERE "{spec.user_col}" IN ({_placeholders(users)})'
+                if cutoff_ms is not None:
+                    query += f' AND "{spec.timestamp_col}" <= ?'
+                    params.append(int(cutoff_ms))
+                rows = saved.execute(query, params)
+                # Reading candidates from the immutable backup bounds the run and
+                # avoids sorting/scanning a live user table under a write lock.
+                reset_checkpoint = spec.table == "history_scan_meta" and cutoff_ms is None
+                compare_indices = [idx for idx, col in enumerate(columns)
+                                   if not reset_checkpoint or col in {"user", "exchange"}]
+                same_values = " AND ".join('"' + columns[idx].replace('"', '""') + '" IS ?' for idx in compare_indices)
+                # A full user cleanup invalidates its scan checkpoint even if a
+                # scan advanced it after the backup. It is derived metadata.
+                identity = "" if reset_checkpoint else "rowid=? AND "
+                sql = f'DELETE FROM "{spec.table}" WHERE {identity}{same_values}'
+                conn = conns[spec.db_name]
+                while batch := rows.fetchmany(250):
+                    owner.check()
+                    if operation:
+                        operation.set_current(f"Delete backed-up rows from {key} ({deleted[key]} committed)")
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        params = ([tuple(row[idx + 1] for idx in compare_indices) for row in batch]
+                                  if reset_checkpoint else batch)
+                        changed = conn.executemany(sql, params).rowcount
+                        owner.check()
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                    deleted[key] += changed
+                    owner.committed_rows += changed
+                    # Yield write admission so continuously collecting accounts
+                    # are not starved by immediately reacquiring SQLite's lock.
+                    owner.cancel.wait(0.02)
+                if operation:
+                    operation.advance(f"Deleted rows from {key}", {"deleted": deleted[key]})
+    except MaintenanceCancelled:
+        cancelled = True
+    except Exception as exc:
+        backup_note = "Completed batches remain deleted; backups were retained. " if owner.committed_rows else "No cleanup rows were committed. "
+        raise RuntimeError(f"Cleanup incomplete after {sum(deleted.values())} committed rows: {exc}. "
+                           f"{backup_note}Retry cleanup to finish.") from exc
+    finally:
+        _close_bundle(conns)
+    return {"total": sum(deleted.values()), "tables": deleted, "cancelled": cancelled}
+
+
 def delete_user_rows(
     db_paths: dict[str, Path],
     users: list[str],
@@ -2263,6 +2332,8 @@ def delete_user_rows(
         raise HTTPException(status_code=422, detail="Select at least one user")
     if _maintenance is not None:
         _maintenance.assert_target(db_paths)
+        if getattr(_maintenance, "online", False):
+            return _delete_online_rows(db_paths, users, cutoff_ms, operation, _maintenance)
     if Path(db_paths[MAIN_DB_NAME]).resolve() == _local_db_path(MAIN_DB_NAME).resolve():
         if _maintenance is None:
             from db_maintenance import run
@@ -2279,8 +2350,8 @@ def delete_user_rows(
                 _maintenance.check()
             if operation:
                 operation.set_current(f"Delete rows from {table_key}")
-            conn = conns[spec.db_name]
-            if not _table_exists(conn, spec.table):
+            conn = conns.get(spec.db_name)
+            if conn is None or not _table_exists(conn, spec.table):
                 deleted[table_key] = 0
                 if operation:
                     operation.advance(f"Skipped missing table {table_key}", {"deleted": 0})
@@ -2841,6 +2912,8 @@ async def _maintain_target(target: str, request: dict, operation=None) -> dict:
             previous_paths = previous.get("staged", {})
             previous_cancel_id = previous.get("cancel_id", previous["id"])
         probe = "try:\n    from db_maintenance import check_remote_capability\nexcept ImportError:\n    raise RuntimeError('Update and restart remote PBGui/PBData before database maintenance; recovery guards are missing') from None\ncheck_remote_capability()\nprint('{}')"
+        if request["kind"] == "cleanup":
+            probe = probe.replace("import check_remote_capability", "import check_remote_capability, OnlineCleanup")
         try:
             await _run_remote_python(target, probe, [])
         except HTTPException as exc:
@@ -2888,7 +2961,7 @@ async def _maintain_target(target: str, request: dict, operation=None) -> dict:
             if not cancel_task.cancelled() and cancel_task.exception() is not None:
                 _log(SERVICE, f"Remote maintenance cancellation not acknowledged on {target}", level="ERROR")
         result = worker.result()
-        if interrupted:
+        if interrupted and request["kind"] != "cleanup":
             raise asyncio.CancelledError
         return result
     except (DatabaseBusyError, MasterUpdateBusyError) as exc:
@@ -2896,7 +2969,7 @@ async def _maintain_target(target: str, request: dict, operation=None) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         _log(SERVICE, f"Database maintenance failed on {target}: {exc}", level="ERROR", meta={"traceback": traceback.format_exc()})
-        if interrupted:
+        if interrupted and request["kind"] != "cleanup":
             raise asyncio.CancelledError from exc
         raise
     finally:
@@ -2930,7 +3003,7 @@ async def _maintain_target(target: str, request: dict, operation=None) -> dict:
             cleanup_task.result()
         finally:
             resources.close()
-        if cleanup_interrupted:
+        if cleanup_interrupted and request["kind"] != "cleanup":
             raise asyncio.CancelledError
 
 
@@ -2949,7 +3022,7 @@ async def recover_maintenance(payload: TargetRef, session: SessionToken = Depend
     return {"operation": _start_operation("maintenance-recovery", 1, runner).to_dict()}
 
 
-async def _assert_maintenance_available(target: str, *, recovery=False) -> None:
+async def _assert_maintenance_available(target: str, *, recovery=False, online_cleanup=False) -> None:
     """Return useful HTTP 409 before queueing; worker-side admission closes the race."""
     from db_maintenance import probe
     from database_lock import DatabaseBusyError
@@ -2957,7 +3030,7 @@ async def _assert_maintenance_available(target: str, *, recovery=False) -> None:
 
     try:
         if target == "local":
-            probe(Path(PBGDIR), recovery=recovery)
+            probe(Path(PBGDIR), recovery=recovery, online_cleanup=online_cleanup)
         else:
             from hashlib import sha256
 
@@ -2965,6 +3038,9 @@ async def _assert_maintenance_available(target: str, *, recovery=False) -> None:
             if not recovery and (receipt.exists() or receipt.is_symlink()):
                 raise DatabaseBusyError("Remote outcome unresolved; recover this target before new maintenance")
             script = "from pathlib import Path\ntry:\n    from db_maintenance import check_remote_capability, probe\nexcept ImportError:\n    raise RuntimeError('Update and restart remote PBGui/PBData; recovery guards are missing') from None\ncheck_remote_capability()\nprobe(Path.cwd(), recovery=" + repr(recovery) + ")\nprint('{}')"
+            if online_cleanup:
+                script = script.replace("import check_remote_capability, probe", "import check_remote_capability, probe, OnlineCleanup")
+                script = script.replace("probe(Path.cwd(), recovery=False)", "probe(Path.cwd(), online_cleanup=True)")
             await _run_remote_python(target, script, [])
     except (DatabaseBusyError, MasterUpdateBusyError, HTTPException) as exc:
         detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
@@ -3251,7 +3327,7 @@ async def cleanup_run(payload: CleanupRunRequest, session: SessionToken = Depend
     if payload.mode == "older" and cutoff_ms is None:
         raise HTTPException(status_code=422, detail="cutoff_ms is required for older cleanup")
     await _assert_known_target(target)
-    await _assert_maintenance_available(target)
+    await _assert_maintenance_available(target, online_cleanup=True)
 
     async def runner(operation: OperationProgress) -> dict[str, Any]:
         result = await _maintain_target(target, {"kind": "cleanup", "users": users, "cutoff_ms": cutoff_ms}, operation)

@@ -13,8 +13,8 @@ Every manual database maintenance write creates a backup first. Destructive acti
 - **local** is the PBGui installation where the page is open.
 - Remote targets are known master nodes from VPS Manager.
 - Source and target must be different for copy and sync operations.
-- PBData write activity can block an operation when changing the affected target safely is not possible.
-- Manual cleanup, user copy, complete DB copy and restore reserve the target exclusively before confirming PBData shutdown and creating backups. A failed stop or unknown service state blocks the operation rather than being treated as an already stopped writer.
+- Cleanup keeps PBData running. It takes online backups from stable read snapshots and deletes in batches of up to 250 rows, with a short pause between batches. Each write lock waits up to 30 seconds. Ordinary scans and sync leases do not block cleanup admission; full restores and database replacement remain excluded.
+- User copy, complete DB copy and restore reserve the target exclusively before confirming PBData shutdown and creating backups. A failed stop or unknown service state blocks these operations rather than being treated as an already stopped writer.
 - Restore changes existing SQLite contents in place, preserving open connections, file identity and WAL handling. PBData restarts only after a consistent result or successful rollback, and only if it was previously running.
 - Remote maintenance uses one target-owned worker/lease for the complete operation. Older remote checkouts or API processes without the writer guards are rejected; update and restart the remote PBGui installation explicitly before retrying. DB Tools does not deploy updates automatically.
 - Long-running operations appear in the progress panel and can also be inspected through the DB Tools log viewer.
@@ -33,7 +33,13 @@ Cleanup removes rows belonging to selected users from `pbgui.db` and `pbgui_trad
 
 The date mode removes rows older than the UTC cutoff from tables with timestamp columns. A fresh preview is required after changing the target, mode, date, or selection.
 
-The target reservation covers backup, every table commit and connection cleanup. If a cleanup or copy fails, the operation attempts to restore the complete pre-operation target bundle before allowing writers to continue.
+Cleanup deletes only the exact selected usernames from all supported user tables. It processes the finite set of rows captured in the full backups and deletes a live row only if its contents still match the saved row. Data added or changed after its snapshot is preserved. No new archive format or restore workflow is required; the backups remain available in Backup Manager.
+
+For full user cleanup, scan checkpoints are reset by user/exchange even if their timestamp advanced after the backup. Date-limited cleanup retains the full comparison. A running collector can create new checkpoints and data again; cleanup does not guarantee a fresh historical reimport while collection continues.
+
+Each batch commits separately. On cancellation, the result reports `cancelled: true`, the actual deleted count and retained backups; confirmed batches stay deleted. A failed batch rolls back, while earlier batches remain committed and the error reports their deleted count. Repeat cleanup to process remaining data. Cleanup never restores a full database over concurrent writes. If backup preparation fails or no rows were deleted, snapshots from that attempt are removed; backups from earlier attempts remain untouched. User copy retains exclusive maintenance with bundle rollback on failure.
+
+Cleanup removes stored data; it does not disable account data collection or sync jobs. An account that is still collected or synced can receive data again.
 
 ## Copy User Data
 

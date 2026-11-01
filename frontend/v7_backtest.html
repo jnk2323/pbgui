@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<script src="/app/js/ohlcv_start_dates.js?v=3"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PBGui — %%BACKTEST_LABEL%% Backtest</title>
@@ -1490,6 +1491,14 @@ function archiveResultApiFetch(path, endpoint, opts) {
 }
 
 function apiHttpError(message, status) {
+  if (Array.isArray(message)) {
+    message = message.map(function(detail) {
+      return detail && typeof detail.msg === 'string' ? detail.msg : '';
+    }).filter(Boolean).join('; ');
+  } else if (message && typeof message === 'object') {
+    message = typeof message.message === 'string' ? message.message
+      : typeof message.msg === 'string' ? message.msg : '';
+  }
   var error = new Error(message || ('HTTP ' + status));
   error.status = status;
   return error;
@@ -3367,7 +3376,7 @@ function showConfigEditor(name, cfg, rawOverride, paramStatusOverride) {
       '<div class="ms-dropdown" id="ms-cfg-exchanges-dd"></div>' +
     '</div></div>';
   html += fieldText2('cfg-name', 'config_name', name, true, null, 'Name of this backtest configuration.\nRenaming on save creates a new folder; the old folder is removed.', 2);
-  html += fieldDate2('cfg-start-date', 'start_date', bt.start_date || '2020-01-01', 'Start date of backtest.', 1);
+  html += (backtestEditorAdapter.isV8 ? fieldBacktestStartDate : fieldDate2)('cfg-start-date', 'start_date', bt.start_date || '2020-01-01', 'Start date. 1st selects the earliest market; All selects the first date available for every selected exchange and coin.', 1);
   html += fieldDate2('cfg-end-date', 'end_date', (bt.end_date && bt.end_date !== 'now') ? bt.end_date : new Date().toISOString().slice(0,10), 'End date of backtest.', 1);
   html += '</div>';
 
@@ -4322,6 +4331,7 @@ var _cfgMsController = window.PBGuiEditorShared.createMultiselectController({
 var _cfgMs = _cfgMsController.state;
 
 function resetBacktestEditorUiState() {
+  _backtestStartDateController.reset();
   [
     'ms-cfg-exchanges',
     'ms-cfg-app-long',
@@ -5100,6 +5110,102 @@ function fieldText2(id, label, value, editable, placeholder, tip, span) {
     pick: _pick
   };
 }();
+
+var _backtestStartDateController = PBGuiOhlcvStartDates.create({
+  isV8:function() { return backtestEditorAdapter.isV8; },
+  visible:function() { var editor=document.getElementById('configs-editor'); return !!editor && editor.style.display !== 'none'; },
+  fetch:function(path, options) { return apiFetch(path, options); },
+  collect:collectBacktestStartLookupConfig, signature:backtestStartLookupSignature,
+  apply:applyBacktestStartDateResult, status:setBacktestStartDateStatus,
+  running:setBacktestStartDateControlsRunning, progress:renderBacktestStartDateProgress,
+  clearProgress:function() { var node=document.getElementById('cfg-ohlcv-start-progress'); if(node) node.style.display='none'; }
+});
+function fieldBacktestStartDate(id, label, value, tip, span) {
+  return PBGuiOhlcvStartDates.renderField(id, label, value, tip, span, {
+    prefix:'cfg', startAction:'setBacktestStartDateFromOhlcv', stopAction:'stopBacktestStartDateLookup', group:fmtGroupSpan
+  });
+}
+function setBacktestStartDateFromOhlcv(mode, button) { return _backtestStartDateController.start(mode, button); }
+function stopBacktestStartDateLookup(silent) { return _backtestStartDateController.stop(silent); }
+async function collectBacktestStartLookupConfig() {
+  var raw=document.getElementById('cfg-raw-json');
+  if (!raw || validateRawJson(raw.value).error) throw new Error('Raw JSON is invalid. Fix it and retry.');
+  if (!ensureRawJsonValidForSave() || !ensureStructuredJsonFieldsValidForSave()) throw new Error('Invalid JSON. Fix it and retry.');
+  return collectConfig();
+}
+function backtestStartLookupSignature(config) {
+  function canonical(value) {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      var result = {};
+      Object.keys(value).sort().forEach(function(key) { result[key] = canonical(value[key]); });
+      return result;
+    }
+    return value;
+  }
+  var effective = Object.assign({}, config || {});
+  delete effective.pbgui; // The PB8 helper removes this metadata before preparation.
+  return JSON.stringify(canonical(effective));
+}
+function setBacktestStartDateStatus(message, kind) {
+  var status = document.getElementById('cfg-ohlcv-start-status');
+  if (!status) return;
+  status.textContent = String(message || '').slice(0, 500);
+  status.style.color = kind === 'error' ? 'var(--red)' : 'var(--text-dim)';
+}
+function setBacktestStartDateControlsRunning(running) {
+  var buttons = Array.from(document.querySelectorAll('.cfg-ohlcv-start-btn'));
+  buttons.forEach(function(button) { button.disabled = !!running; });
+}
+function renderBacktestStartDateProgress(payload) {
+  var container = document.getElementById('cfg-ohlcv-start-progress');
+  var fill = document.getElementById('cfg-ohlcv-start-progress-fill');
+  var label = document.getElementById('cfg-ohlcv-start-progress-label');
+  var stopButton = document.getElementById('cfg-ohlcv-start-stop');
+  if (!container || !fill || !label || !stopButton) return;
+  var progress = payload && payload.progress || {};
+  var percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  var count = progress.total ? progress.completed + '/' + progress.total + ' · ' : '';
+  var detail = progress.message || (payload && payload.status === 'stopping' ? 'Stopping...' : 'Working...');
+  container.style.display = '';
+  fill.style.width = percent + '%';
+  label.textContent = (count + detail).slice(0, 500);
+  label.title = label.textContent;
+  stopButton.disabled = !_backtestStartDateController.state.run || !!(payload && (payload.status === 'stopping' || payload.stop_requested));
+  if (_backtestStartDateController.state.run) _backtestStartDateController.state.run.lastProgress = progress;
+}
+async function applyBacktestStartDateResult(run, response) {
+  var currentConfig;
+  try { currentConfig = await collectBacktestStartLookupConfig(); }
+  catch (error) {
+    if (_backtestStartDateController.state.run === run && !run.stopping) setBacktestStartDateStatus('Lookup unsuccessful: ' + error.message, 'error');
+    return;
+  }
+  if (_backtestStartDateController.state.run !== run || run.stopping) return;
+  if (run.signature !== backtestStartLookupSignature(currentConfig)) {
+    setBacktestStartDateStatus('Lookup unsuccessful: editor inputs changed during lookup. Retry.', 'error');
+    return;
+  }
+  var options = response && response.result && response.result.start_date_options;
+  var selected = options && options[run.mode];
+  if (!selected || !selected.available || !selected.start_date) {
+    var pair = options && ((options.missing_market_pairs || [])[0] || (options.unknown_start_pairs || [])[0]);
+    var pairText = pair ? ' First unresolved pair: ' + pair.coin + ' @ ' + pair.exchange + '.' : '';
+    setBacktestStartDateStatus('Lookup unsuccessful: ' + ((selected && selected.detail) || 'No matching OHLCV start date is available.') + pairText + ' Retry after correcting the selection.', 'error');
+    return;
+  }
+  var startInput = document.getElementById('cfg-start-date');
+  if (!startInput) return;
+  startInput.value = selected.start_date;
+  startInput.dataset.prev = selected.start_date;
+  cfgEnsureDateOrder('cfg-start-date', 'cfg-end-date', 'start', false);
+  scheduleStructuredEditorSync();
+  if (_ohlcvPreflightController && _ohlcvPreflightController.isOpen()) _ohlcvPreflightController.markStale();
+  var coverage = run.mode === 'earliest' && options.known_pair_count < options.pair_count
+    ? ' Partial coverage: ' + options.known_pair_count + ' of ' + options.pair_count + ' market pairs resolved.' : '';
+  setBacktestStartDateStatus('Lookup succeeded: start_date set to ' + selected.start_date + '.' + coverage);
+}
+
 function fieldDate2(id, label, value, tip, span) {
   var inputHtml = PBGuiDateInput.render(id, value, {clearSemantic:true});
   return fmtGroupSpan(id, label, inputHtml, tip, span || 1);
