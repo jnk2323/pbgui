@@ -52,6 +52,166 @@ def test_two_jobs_share_worker_and_deadline(queue):
     assert worker_step(queue, worker, now=201) == second
 
 
+@pytest.mark.parametrize('paused', [False, True])
+def test_single_optimizer_approval_never_claims_other_jobs_and_replays_once(queue, monkeypatch, paused):
+    """An approved normal cloud run owns one worker, frozen stop policy and cleanup."""
+    from api.vast import RentalPreferences
+    from vast_credentials import VastCredentialStore
+    from vast_queue import single_job_worker_id
+    queue, previous_worker = queue
+    store = queue.store
+    store.update(previous_worker, rental_state='deletion_verified', status='completed')
+    settings = RentalPreferences(budget=5, hours=24).model_dump()
+    queue.update(gpu_preferences=settings, paused=paused)
+    approval = 'd' * 32
+    target, unrelated = 'c' * 32, 'b' * 32
+    store.update(target, rental_authorization_id=approval)
+    convergence = {'convergence_enabled': True, 'convergence_min_exact': 512,
+                   'convergence_patience': 512, 'convergence_tolerance_pct': .2}
+    scope = {'id': approval, 'job_id': target, 'budget': 5, 'hours': 24,
+             'convergence': convergence, 'settings': settings, 'credential_generation': 1,
+             'queue_pause_generation': 0}
+    calls = []
+    monkeypatch.setattr(VastCredentialStore, 'metadata', lambda self: {'generation': 1})
+    monkeypatch.setattr('vast_queue.preflight_local_metadata', lambda *args, **kwargs: None)
+
+    def start(identifier, offer, hours, budget):
+        """Stand in for paid rental creation while retaining real durable state."""
+        calls.append(identifier)
+        intent = store.read(identifier, 'intent.json')
+        intent.update(offer={'download_gb_usd': .01, 'upload_gb_usd': .01}, transfer_reserve_usd=1)
+        write_json(store.directory(identifier) / 'intent.json', intent)
+        return store.update(identifier, rental_state='active', deadline=10000, status='idle')
+
+    monkeypatch.setattr(store, 'start', start)
+    before = queue.read()
+    assert [row['id'] for row in queue.waiting()] == [unrelated]
+    worker = queue.start({'id': 123, 'machine_id': 456}, 24, 5, 0, job_authorization=scope)
+    assert worker['id'] == single_job_worker_id(approval)
+    assert queue.read() == before
+    assert worker_step(queue, worker['id'], now=100) == target
+    assert store.read(target)['convergence_config'] == convergence
+    assert store.read(unrelated)['status'] == 'ready'
+    store.update(target, status='completed', final_collected=True)
+    assert worker_step(queue, worker['id'], now=200) is None
+    assert store.read(worker['id'], 'control.json')['cleanup'] is True
+    store.update(worker['id'], rental_state='deletion_verified', status='completed')
+    replay = queue.start({'id': 999}, 24, 5, 0, job_authorization=scope)
+    assert replay['rental_state'] == 'deletion_verified'
+    assert calls == [worker['id']]
+    assert store.read(unrelated)['status'] == 'ready'
+
+
+@pytest.mark.parametrize('change', ['budget', 'account', 'new_pause', 'scope'])
+def test_single_optimizer_rejects_changed_rental_consent(queue, monkeypatch, change):
+    """Native callers also enforce account, resource and exact job approval."""
+    from api.vast import RentalPreferences
+    from vast_credentials import VastCredentialStore
+    from vast_provider import VastError
+    from optimize_convergence import DEFAULTS
+    queue, worker = queue
+    queue.store.update(worker, rental_state='deletion_verified', status='completed')
+    settings = RentalPreferences(budget=5, hours=24).model_dump()
+    queue.update(gpu_preferences=settings, paused=True)
+    approval = 'd' * 32
+    queue.store.update('c' * 32, rental_authorization_id=approval)
+    scope = {'id': approval, 'job_id': 'c' * 32, 'budget': 5, 'hours': 24,
+             'convergence': dict(DEFAULTS), 'settings': dict(settings), 'credential_generation': 1,
+             'queue_pause_generation': 0}
+    if change == 'budget':
+        queue.update(gpu_preferences={**settings, 'budget': 10})
+    if change == 'scope':
+        scope['job_id'] = 'b' * 32
+    if change == 'new_pause':
+        queue.action('pause')
+    monkeypatch.setattr(VastCredentialStore, 'metadata', lambda self: {'generation': 2 if change == 'account' else 1})
+    monkeypatch.setattr(queue.store, 'start', lambda *args: pytest.fail('No rental may start'))
+    with pytest.raises(VastError):
+        queue.start({'id': 123, 'machine_id': 456}, 24, 5, 0, job_authorization=scope)
+
+
+@pytest.mark.parametrize('control', ['pause', 'end', 'worker_end', 'cleanup'])
+def test_independent_optimizer_still_honors_subsequent_controls(queue, monkeypatch, control):
+    """A start consent bypasses only the old pause, never a newer user command."""
+    from api.vast import RentalPreferences
+    from optimize_convergence import DEFAULTS
+    queue, worker = queue
+    store, approval, target = queue.store, 'd' * 32, 'c' * 32
+    settings = RentalPreferences().model_dump()
+    scope = {'id': approval, 'job_id': target, 'budget': 1, 'hours': 1,
+             'convergence': dict(DEFAULTS), 'settings': settings, 'credential_generation': 1,
+             'queue_pause_generation': 0}
+    store.update(target, rental_authorization_id=approval)
+    store.update(worker, job_authorization=scope, queue_pause_generation=0)
+    intent = store.read(worker, 'intent.json')
+    intent['job_authorization'] = scope
+    write_json(store.directory(worker) / 'intent.json', intent)
+    queue.update(paused=True)
+    monkeypatch.setattr(store, 'launch_service', lambda *args: None)
+    if control in {'pause', 'end'}:
+        queue.action(control)
+    elif control == 'worker_end':
+        queue.worker_action(worker, 'end')
+    else:
+        store.control(worker, 'cleanup')
+    assert worker_step(queue, worker, now=100) is None
+    assert store.read(target)['status'] == 'ready'
+    assert store.read('b' * 32)['status'] == 'ready'
+    if control == 'pause':
+        assert queue.read()['queue_pause_generation'] == 1
+        # Resuming only this worker cannot release the unrelated shared queue.
+        queue.worker_action(worker, 'start')
+        assert queue.read()['paused'] is True
+        assert worker_step(queue, worker, now=101) == target
+        assert store.read('b' * 32)['status'] == 'ready'
+
+
+def test_new_pause_during_single_job_preflight_cancels_rental(queue, monkeypatch):
+    """The native start rechecks controls after slow metadata work, under its lock."""
+    from api.vast import RentalPreferences
+    from optimize_convergence import DEFAULTS
+    from vast_credentials import VastCredentialStore
+    from vast_provider import VastError
+    queue, worker = queue
+    queue.store.update(worker, rental_state='deletion_verified', status='completed')
+    settings = RentalPreferences().model_dump()
+    queue.update(gpu_preferences=settings, paused=True)
+    approval = 'd' * 32
+    queue.store.update('c' * 32, rental_authorization_id=approval)
+    scope = {'id': approval, 'job_id': 'c' * 32, 'budget': 1, 'hours': 1,
+             'convergence': dict(DEFAULTS), 'settings': settings, 'credential_generation': 1,
+             'queue_pause_generation': 0}
+    monkeypatch.setattr(VastCredentialStore, 'metadata', lambda self: {'generation': 1})
+    monkeypatch.setattr('vast_queue.preflight_local_metadata', lambda *args, **kwargs: queue.action('pause'))
+    monkeypatch.setattr(queue.store, 'start', lambda *args: pytest.fail('New pause must prevent renting'))
+    with pytest.raises(VastError, match='paused or ended after review'):
+        queue.start({'id': 123, 'machine_id': 456}, 1, 1, 0, job_authorization=scope)
+
+
+def test_unpaid_single_job_reservation_cannot_reclaim_reassigned_input(queue, monkeypatch):
+    """A stale AI/manual approval cannot rent after a newer manual review took the job."""
+    from api.vast import RentalPreferences
+    from optimize_convergence import DEFAULTS
+    from vast_credentials import VastCredentialStore
+    from vast_provider import VastError
+    from vast_queue import single_job_worker_id
+    queue, previous_worker = queue
+    queue.store.update(previous_worker, rental_state='deletion_verified', status='completed')
+    settings = RentalPreferences().model_dump()
+    queue.update(gpu_preferences=settings)
+    approval, target = 'd' * 32, 'c' * 32
+    scope = {'id': approval, 'job_id': target, 'hours': 1, 'budget': 1, 'settings': settings,
+             'convergence': dict(DEFAULTS), 'credential_generation': 1, 'queue_pause_generation': 0}
+    worker = single_job_worker_id(approval)
+    queue.store.publish({'id': worker, 'kind': 'worker', 'status': 'ready', 'rental_state': 'none'},
+                        intent={'job_authorization': scope})
+    queue.store.update(target, rental_authorization_id='e' * 32)
+    monkeypatch.setattr(VastCredentialStore, 'metadata', lambda self: {'generation': 1})
+    monkeypatch.setattr(queue.store, 'start', lambda *args: pytest.fail('Stale reservation cannot rent'))
+    with pytest.raises(VastError, match='no longer belongs'):
+        queue.start({'id': 123}, 1, 1, 0, job_authorization=scope)
+
+
 @pytest.mark.parametrize('change', ['completed', 'failed', 'cancelled', 'ready', 'lease', 'collected'])
 def test_rental_end_rechecks_inventory_under_state_lock(queue, monkeypatch, change):
     """Rental-end writes use current lease/status/result evidence, never the list snapshot."""

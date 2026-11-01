@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import sqlite3
@@ -176,10 +177,18 @@ def load_indexed_results(
                     connection.commit()
                 finally:
                     connection.close()
-        return [copy.deepcopy(payloads[str(path.parent)]) for path in paths if str(path.parent) in payloads]
+        results = [copy.deepcopy(payloads[str(path.parent)]) for path in paths if str(path.parent) in payloads]
     except (OSError, OverflowError, RuntimeError, sqlite3.Error, ValueError) as exc:
         _log(SERVICE, f"Backtest result index unavailable; rebuilding summaries from files: {exc}", level="WARNING")
-        return builder(paths)
+        results = builder(paths)
+    # Match the AI capability registry's non-reversible managed result identity.
+    # Enrich warm and fallback reads without rebuilding the persistent index.
+    for item in results:
+        identity = str(item.get('path') or '')
+        if identity:
+            opaque = hashlib.sha256(f'backtest\0{normalized_version}\0{identity}'.encode('utf-8')).hexdigest()[:32]
+            item['resource'] = f'pbgui://backtest/{normalized_version}/{opaque}'
+    return results
 
 
 def invalidate_result(version: str, result_path: Path) -> None:

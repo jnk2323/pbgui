@@ -1,5 +1,7 @@
 # Changelog
 
+- [v2.10.5](releases/v2.10.5.md)
+
 - [v2.10.4](releases/v2.10.4.md)
 
 - [v2.10.3](releases/v2.10.3.md)

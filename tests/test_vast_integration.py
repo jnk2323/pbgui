@@ -347,10 +347,11 @@ def test_http_410_names_the_failed_resource(monkeypatch, path, message):
 
 def test_all_routes_require_authentication(client):
     """No account, secret, marketplace or page route is public."""
-    _,_,app=client
-    for route in app.routes:
-        if route.path.startswith('/api/vast'):
-            assert any(d.call is require_auth for d in route.dependant.dependencies)
+    # Inspect the owning router: recent FastAPI versions defer include_router
+    # expansion, so app.routes contains _IncludedRouter wrappers without .path.
+    assert vast.router.routes
+    for route in vast.router.routes:
+        assert any(d.call is require_auth for d in route.dependant.dependencies)
 
 
 def test_page_has_referral_and_local_assets(client):

@@ -82,7 +82,7 @@ def test_vast_controls_from_real_menu_preserve_shell_and_guide():
             page.locator('#collect-job').click()
             page.wait_for_function("document.getElementById('queue-message').textContent.includes('Pareto results collected')")
             assert sum(method == 'POST' and url.endswith('/collect') for method, url in calls) == 1
-            assert any('/app/js/vast.js?v=177' in url for _, url in calls)
+            assert any('/app/js/vast.js?v=178' in url for _, url in calls)
             location_before = page.url
             page.locator('#pbgui-guide-btn').click()
             page.wait_for_function("document.getElementById('pbgui-shared-help-ovl')?.getAttribute('aria-hidden')==='false'")
@@ -181,7 +181,11 @@ def test_cloud_setup_editor_selection_and_queue(tmp_path):
                 data = dict(preferences)
             elif self.path == '/api/vast/credentials':
                 data = {'configured':True}
-            elif self.path == '/api/vast/queue/start':
+            elif self.path.endswith('/start-preview'):
+                data = dict(review_id='e'*32, payload_digest='f'*64, name='Selected optimizer',
+                            iterations=20000000, gpu_name='RTX 3060', max_price_per_hour=.3,
+                            hours=24, budget=5, exchanges=['bybit'], convergence={'convergence_enabled':False})
+            elif self.path == '/api/vast/queue/start' or (self.path.startswith('/api/vast/jobs/') and self.path.endswith('/start')):
                 starts.append(payload)
                 release_start.wait(timeout=5)
                 data = {'id':'mock-worker'}
@@ -422,7 +426,7 @@ def test_cloud_setup_editor_selection_and_queue(tmp_path):
                 page.evaluate('PBGuiVast.hideSettings()')
                 assert page.locator('#api-key').input_value() == ''
                 assert not any('/start' in call for call in calls)
-                page.evaluate("window.PBGuiDialogs = {confirm: async () => {throw new Error('Unexpected confirmation');}}")
+                page.evaluate("window.PBGuiDialogs = {confirm: async options => {if(options.title !== 'Start this Vast optimizer?') throw new Error('Wrong start review'); return true;}}")
                 page.locator('[data-vast-view=offers]').click()
                 page.locator('#gpu-model').fill('unsaved-other-type')
                 row.locator('button[title="Start"]').click()
@@ -432,9 +436,9 @@ def test_cloud_setup_editor_selection_and_queue(tmp_path):
                 assert row.locator('td').nth(3).inner_text() == 'Starting…'
                 assert row.locator('button[title="Start"]').is_disabled()
                 release_start.set()
-                page.wait_for_function("document.getElementById('message').textContent === ''")
+                page.wait_for_function("document.getElementById('message').textContent.includes('rental authorized')")
                 assert len(starts) == 1
-                assert starts[0] == {'use_saved_settings':True,'accept_rental_and_cleanup':True}
+                assert starts[0] == {'review_id':'e'*32, 'payload_digest':'f'*64, 'accept_rental_and_cleanup':True}
                 assert page.locator('#log-panel').is_hidden()
                 assert page.locator('#queue #vast-jobs').count() == 0
                 assert page.locator('#cloud-rental-controls').count() == 0

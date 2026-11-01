@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack
 import ctypes
 import errno
 import math
@@ -62,7 +63,7 @@ SUPPORTED_RENTAL_IMAGE_REVISIONS = {
     "ghcr.io/msei99/pbgui-pb8-worker@sha256:0d827eb097a9d26c9088421097b4a9f0eacf660f08613871c48946ddf71a0a88": ORIGINAL_REVISION,
 }
 SUPPORTED_RENTAL_IMAGES = tuple(SUPPORTED_RENTAL_IMAGE_REVISIONS)
-from vast_config_validation import METRICS, validate_cloud_config
+from vast_config_validation import MAX_ITERATIONS, METRICS, validate_cloud_config
 
 TERMINAL = {"completed", "cancelled", "failed"}
 MAX_JOB_RECORD_BYTES = 16 * 1024 * 1024
@@ -203,8 +204,8 @@ def _write_input_archive(folder: Path, relative_files: list[Path], target: Path,
 
 def native_job_config(source: dict, iterations: int, workers: int, use_adg: bool) -> dict:
     """Prepare a supported fresh GPU job without local CUDA or source edits."""
-    if type(iterations) is not int or not 256 <= iterations <= 10_000_000 or type(workers) is not int or not 1 <= workers <= 64:
-        raise VastError("Choose 256–10,000,000 iterations and 1–64 CPU workers", 422)
+    if type(iterations) is not int or not 256 <= iterations <= MAX_ITERATIONS or type(workers) is not int or not 1 <= workers <= 64:
+        raise VastError(f"Choose 256–{MAX_ITERATIONS:,} iterations and 1–64 CPU workers", 422)
     errors = validate_cloud_config(source, iterations, workers, use_adg=use_adg, image=IMAGE, revision=REVISION)
     if errors:
         raise VastError("Cloud configuration is invalid: " + "; ".join(
@@ -480,19 +481,32 @@ class JobStore:
                                error="Input preparation interrupted by process shutdown. Requeue to prepare again.")
 
     def create_preparation(self, name: str, iterations: int, workers: int, use_adg: bool,
-                           *, requeue_from: str | None = None) -> dict:
+                           *, requeue_from: str | None = None, operation_id: str | None = None) -> dict:
         """Persist a pending input snapshot before its slower file work starts."""
         ensure_private_directory(self.root)
         ensure_private_directory(self.root / "jobs")
-        identifier = uuid.uuid4().hex
+        identifier = (uuid.uuid5(uuid.NAMESPACE_URL, 'pbgui-vast-input:' + job_id(operation_id)).hex
+                      if operation_id is not None else uuid.uuid4().hex)
         state = {"id": identifier, "config_name": config_name(name), "status": "preparing", "rental_state": "none",
-                 "iterations": iterations, "workers": workers, "auto_cpu_workers": True, "created_at": time.time(), "generation": 0,
+                 "iterations": iterations, "workers": workers, "use_adg": use_adg, "auto_cpu_workers": True, "created_at": time.time(), "generation": 0,
                  "preparation_owner": {"pid": os.getpid(), "created_at": psutil.Process().create_time()},
                  "exact_completed": 0, "gpu_candidates": 0, "error": None,
                  "input_progress": {"stage": "selecting", "files_completed": 0, "files_total": 0,
                                     "bytes_completed": 0, "bytes_total": 0}}
         if requeue_from is not None:
             state['requeue_from'] = job_id(requeue_from)
+        if operation_id is not None:
+            state['operation_id'] = operation_id
+            state['rental_authorization_id'] = operation_id
+            with advisory_file_lock(self.root / '.lock'):
+                if (self.root / 'jobs' / identifier).exists():
+                    existing = self.read(identifier)
+                    if any(existing.get(key) != state.get(key) for key in
+                           ('operation_id', 'config_name', 'iterations', 'workers', 'use_adg', 'requeue_from')):
+                        raise VastError('Cloud preparation belongs to another operation', 409)
+                    return existing
+                self.publish(state)
+            return state
         self.publish(state)
         return state
 
@@ -814,7 +828,11 @@ class JobStore:
                 raise VastError("Invalid cloud rental image/revision", 422)
             require_public_image(intent["image"])
             secrets = VastCredentialStore(self.root).secrets()
+            if (intent.get('job_authorization') is not None
+                    and intent['job_authorization'].get('credential_generation') != secrets['generation']):
+                raise VastError('Vast credentials changed after single-job approval; review the account again', 409)
             if (queue_state.get('pool_enabled') and state.get('kind') == 'worker'
+                    and not intent.get('job_authorization')
                     and (queue_state.get('pool_authorization') or {}).get('credential_generation') != secrets['generation']):
                 raise VastError('Vast credentials changed; start the GPU pool again to authorize this account', 422)
             account = VastClient(secrets["api_key"]).account()
@@ -837,10 +855,23 @@ class JobStore:
                 intent['deadline'] = min(intent['deadline'], intent['gpu_replacement']['deadline'])
                 if intent['deadline'] - now < 900:
                     raise VastError('Remaining replacement time is below the minimum rental duration', 409)
-            write_json(directory / "intent.json", intent)
-            self.update(identifier, status="provisioning", rental_state="creation_pending", deadline=intent["deadline"],
-                        budget_usd=budget, price_hour_usd=rate, offer_id=offer["id"], gpu_name=offer.get("gpu_name"),
-                        started_at=now, allocated_cpus=min(64, int(offer["cpu_cores"])))
+            with ExitStack() as acceptance_locks:
+                scope = intent.get('job_authorization')
+                if scope is not None:
+                    child_id = job_id(scope.get('job_id'))
+                    child_directory = self.directory(child_id)
+                    acceptance_locks.enter_context(advisory_file_lock(child_directory / '.control-lock'))
+                    acceptance_locks.enter_context(advisory_file_lock(child_directory / '.state-lock'))
+                    child = self.read(child_id)
+                    child_control = self.read(child_id, 'control.json')
+                    if (child_control.get('stop') or child_control.get('cleanup')
+                            or child.get('status') != 'ready' or child.get('lease_id')
+                            or child.get('rental_authorization_id') != scope.get('id')):
+                        raise VastError('The approved optimizer changed or was stopped before rental', 409)
+                write_json(directory / "intent.json", intent)
+                self.update(identifier, status="provisioning", rental_state="creation_pending", deadline=intent["deadline"],
+                            budget_usd=budget, price_hour_usd=rate, offer_id=offer["id"], gpu_name=offer.get("gpu_name"),
+                            started_at=now, allocated_cpus=min(64, int(offer["cpu_cores"])))
             try:
                 self.launch_service(identifier, "run")
                 self.launch_service(identifier, "guard")

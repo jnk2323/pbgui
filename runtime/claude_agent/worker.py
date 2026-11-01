@@ -15,10 +15,13 @@ from claude_agent_sdk import (
 from jsonschema import Draft202012Validator
 
 MAX_LINE = 2 * 1024 * 1024
+# Catalogue capacity is independent of the parent's 64-call execution budget.
+MAX_TOOL_DEFINITIONS = 256
 MESSAGES = {
     "subscription": "Claude requires a subscription login; API billing is disabled.",
     "model": "Claude changed the selected model.",
     "tools": "Claude enabled an unexpected tool.",
+    "tool_catalog": "Claude tool catalogue is invalid or exceeds its size limit.",
     "provider": "Claude request failed. Check account access and usage limits.",
     "incomplete": "Claude did not complete the reply.",
     "structured": "Claude did not return the required structured decision.",
@@ -73,14 +76,16 @@ async def main(input_value, pending):
         Draft202012Validator.check_schema(output_schema)
         validator = Draft202012Validator(output_schema)
     specs = input_value.get("tools") or []
-    if not isinstance(specs, list) or len(specs) > 64:
-        raise WorkerError("tools")
+    if not isinstance(specs, list) or len(specs) > MAX_TOOL_DEFINITIONS:
+        raise WorkerError("tool_catalog")
     names = set()
     tools = []
     for spec in specs:
+        if not isinstance(spec, dict):
+            raise WorkerError("tool_catalog")
         name = spec.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", name) or name in names:
-            raise WorkerError("tools")
+            raise WorkerError("tool_catalog")
         names.add(name)
         schema = spec.get("input_schema") or {"type": "object", "properties": {}}
         Draft202012Validator.check_schema(schema)

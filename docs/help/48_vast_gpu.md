@@ -290,9 +290,15 @@ in this cloud profile. A historical traceback path such as `/opt/passivbot`, or 
 line number, does not identify the image or execution host. Without the original
 config and rental intent, the historical FET failure cannot be reconstructed.
 
+## Start one prepared optimizer
+
+Open **PBv8 → Optimize → Queue** and click **▶ Start** on the prepared cloud job, or **Open log → Start**. The review names that exact frozen job, exchanges/dates, iterations, GPU requirements, maximum hourly price, budget, hours and stagnation rule. **Start job** authorizes one GPU rental for that job, with automatic cleanup afterward. **Cancel** does not rent or start anything.
+
+This also works for input already prepared by an AI request; no AI chat or model call is required. The shared queue can remain paused, and other jobs and global **Auto rent & start** stay unchanged. A later Pause/End or a change to the input, account or saved limits invalidates a pending review. Click Start again to review current values. Reviews expire after 15 minutes. Repeated confirmation of the same review cannot rent a second GPU. Existing rental capacity and cleanup checks still apply; an existing rental is never stopped implicitly.
+
 ## GPU pool and shared rentals
 
-Set **Max concurrent GPUs** in **Rental & Automation** (default **1**, maximum **16**). To avoid starting every queued job manually, set **Auto rent & start** to **On** and save. The confirmation explicitly authorizes the per-rental and simultaneous budget targets. From then on, **Save & Queue** is enough: as soon as input preparation finishes, PBGui rents up to the saved limit and starts one optimizer on each GPU. Compatible idle GPUs are reused first. Provisioning and cleanup rentals count toward the limit until deletion is confirmed. **Auto rent & start** also works with a limit of 1. With Auto rent off, **Start** rents only one GPU for the existing queue, even if Max concurrent GPUs is higher; adding another job cannot authorize another rental. For an additional explicit rental while other jobs run, select a different offer under **GPU & Offers** and click **Rent**. Start that reserved GPU from its own Queue card; only one manual reservation can await Start queue at a time.
+Set **Max concurrent GPUs** in **Rental & Automation** (default **1**, maximum **16**). To avoid starting every queued job manually, set **Auto rent & start** to **On** and save. The confirmation explicitly authorizes the per-rental and simultaneous budget targets. From then on, **Save & Queue** is enough: as soon as input preparation finishes, PBGui rents up to the saved limit and starts one optimizer on each GPU. Compatible idle GPUs are reused first. Provisioning and cleanup rentals count toward the limit until deletion is confirmed. **Auto rent & start** also works with a limit of 1. The job row’s **Start** always reviews only that selected job, independently of Auto rent. Adding another job does not authorize a manual rental. For an additional explicit rental while other jobs run, select a different offer under **GPU & Offers** and click **Rent**. Start that reserved GPU from its own Queue card; only one manual reservation can await Start queue at a time.
 
 Hours, budget and idle cleanup apply **per GPU rental**. The settings show the combined simultaneous budget targets. This is not a lifetime pool spending cap: while the pool is enabled and prepared jobs are waiting, it may rent replacement GPUs after earlier rentals end. Fresh offers must still satisfy your saved requirements and host exclusions. If none matches, the queue shows the reason and retries automatically.
 
@@ -300,10 +306,7 @@ Hours, budget and idle cleanup apply **per GPU rental**. The settings show the c
 
 When a later job needs more transfer allowance, a worker with the current budget-control guard can automatically move unused rental time into transfer reserve within the same authorized budget. PBGui waits for the worker to confirm the shorter deadline before dispatching the job. A pending adjustment prevents idle cleanup. Older guards or insufficient remaining budget show a reason to adjust **Transfer reserve/Budget** manually; PBGui does not spend an unconfirmed allowance or increase the budget automatically.
 
-In **Rental & Automation**, save maximum hours, budget target and idle cleanup independently of GPU requirements. The job row’s **Start** action uses these saved settings and finds a current matching offer. With the default limit of 1, PBGui
-creates one instance, establishes verified SSH access, starts the first job,
-imports its results and runs the next job on the same GPU. One optimizer runs
-at a time on each GPU; its CPU worker count comes from its configuration.
+In **Rental & Automation**, save maximum hours, budget target and idle cleanup independently of GPU requirements. Shared rentals started through **Auto rent & start**, or an explicitly rented GPU’s **Start queue**, establish verified SSH access and process compatible queued jobs sequentially on that GPU. One optimizer runs at a time on each GPU; its CPU worker count comes from its configuration. A job row’s **Start** instead uses the single-job review above and cleans up its dedicated rental after that job.
 
 Later compatible jobs also use this worker. Input data is cached by checksum,
 so subsequent jobs transfer only missing or changed market files. Each job has

@@ -1,5 +1,7 @@
 # PBv8 Optimize
 
+For a normal cloud optimizer, use **Queue → ▶ Start** on its prepared job, or **Open log → Start**. Review and confirm the single-job rental; no AI chat is required. See [manual single-job start](48_vast_gpu.md#start-one-prepared-optimizer).
+
 ## Collect Pareto without stopping
 
 If collection finishes while this browser tab is hidden, returning to **Results** or **Paretos** loads the completed publication automatically, including an already selected result when no local optimizer is running. The current view, selection and edits stay in place.
@@ -246,6 +248,8 @@ The Scenario Generator turns one PB8 Optimize config into a reproducible group o
 - Manual Suite edits after Apply clear generator provenance because the saved Suite no longer matches the previewed experiment.
 
 ### Detailed Template Settings
+
+Opening or continuing an optimizer result restores its saved Training/Holdout plan, including the separate validation metadata written with the run. The visual editor shows the original windows immediately; no regeneration is required. A saved plan that does not match the native training suite blocks import with a visible error. Legacy runs without saved validation metadata cannot supply an inferred Holdout.
 
 1. Set the base **exchanges**, **start_date**, and **end_date** in Backtest Settings. The generator creates its windows backwards from the base end date and never creates a window before the base start date. An `end_date` of `now` is resolved to today's date for the preview.
 2. Open **Suite Mode**. The generator is available in PB8 Optimize even while Suite Mode is disabled.

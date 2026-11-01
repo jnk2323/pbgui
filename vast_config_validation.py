@@ -8,6 +8,7 @@ from vast_scenarios import scenario_plan
 from vast_worker_compatibility import worker_compatibility_errors
 
 SERVICE = 'Vast'
+MAX_ITERATIONS = 20_000_000
 PROFILE_IMAGE = 'ghcr.io/msei99/pbgui-pb8-worker@sha256:1941f03f96af1fca2062bcf8f9fa45939e1528af2d03f3322060945e9fe140b1'
 PROFILE_REVISION = 'b9d6692ea41266ecb4ab81d40bb5e5baef29b50a'
 _METRIC_CONTRACT = json.loads((Path(__file__).resolve().parent / 'setup/vast_gpu_benchmark/gpu_metric_contract.json').read_text())
@@ -132,8 +133,8 @@ def validate_cloud_config(config, iterations=None, workers=None, *, use_adg=Fals
         error('backtest.btc_collateral_cap', 'BTC collateral is not supported by this cloud profile.')
     iterations = opt.get('iters', 512) if iterations is None else iterations
     workers = (gpu.get('exact_workers') or opt.get('n_cpus') or 4) if workers is None else workers
-    if type(iterations) is not int or not 256 <= iterations <= 10_000_000:
-        error('optimize.iters', 'Choose 256–10,000,000 iterations.')
+    if type(iterations) is not int or not 256 <= iterations <= MAX_ITERATIONS:
+        error('optimize.iters', f'Choose 256–{MAX_ITERATIONS:,} iterations.')
     if type(workers) is not int or not 1 <= workers <= 64:
         error('optimize.gpu.exact_workers', 'Choose 1–64 CPU workers.')
     exchanges = bt.get('exchanges', [])
@@ -191,8 +192,11 @@ def validate_cloud_config(config, iterations=None, workers=None, *, use_adg=Fals
                 error(path, 'Conflicting reducer aliases.')
             if basis and (not isinstance(basis, str) or basis not in REDUCERS):
                 error(path, 'Unsupported aggregate/stat.')
-            if basis and (named or (group == 'scoring' and ('scenario' not in entry and objective or not suite))):
-                error(path, 'Aggregate cannot be combined with a named scenario; scoring aggregates require suite mode.')
+            if basis and (named or (group == 'scoring' and 'scenario' not in entry and objective)):
+                error(path, 'Aggregate cannot be combined with a named scenario.')
+            # The pinned GPU backend exposes scalar metrics under reducer keys
+            # too (_single_scenario_metric_surface; std is zero). A normal single
+            # backtest does not require enabling an artificial scenario suite.
             if group == 'scoring':
                 if entry.get('goal', 'max') not in ('min', 'max'):
                     error(path + '.goal', 'Goal must be min or max.')

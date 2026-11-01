@@ -14,6 +14,65 @@ def poll_cloud(page):
         page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
 
 
+@pytest.mark.parametrize('entry', ['row', 'detail'])
+@pytest.mark.parametrize('accept', [False, True])
+def test_manual_single_job_start_reviews_costs_and_keeps_other_jobs_paused(cloud_page, entry, accept):
+    """Real buttons and the shared cost dialog use only the selected native job."""
+    page, data, calls, overrides, held = cloud_page
+    target = data['jobs'][0]
+    target.update(status='ready', rental_state='none', lease_id=None,
+                  rental_authorization_id='c' * 32, iterations=20000000)
+    data['worker'] = None
+    data['queue']['paused'] = True
+    other = dict(target, id='b' * 32, config_name='Leave this optimizer paused')
+    data['jobs'].append(other)
+    preview_path = '/api/vast/jobs/' + target['id'] + '/start-preview'
+    start_path = '/api/vast/jobs/' + target['id'] + '/start'
+    preview = dict(review_id='e' * 32, payload_digest='f' * 64, name='HYPE manual 20M',
+                   iterations=20000000, exchanges=['bybit', 'hyperliquid'], start_date='2024-12-05',
+                   end_date='2026-10-30', gpu_name='RTX 3060', max_price_per_hour=.3, budget=5, hours=24,
+                   convergence=dict(convergence_enabled=True, convergence_min_exact=512,
+                                    convergence_patience=512, convergence_tolerance_pct=.2))
+    overrides[preview_path] = (200, json.dumps(preview), {})
+    overrides[start_path] = 'hold'
+    page.reload()
+    page.wait_for_function('PBGuiVast.queueItems().length === 2')
+    # Load the actual shared modal implementation, rather than the fixture stub.
+    page.add_script_tag(content=(ROOT / 'frontend/js/pbgui_dialogs.js').read_text())
+    row = page.locator('tr[data-cloud-id="' + target['id'] + '"]')
+    if entry == 'detail':
+        row.locator('[title="Open log"]').click()
+        page.locator('#start-job').click()
+    else:
+        row.locator('[title="Start"]').click()
+    dialog = page.locator('#pbgui-dialog-ovl')
+    page.wait_for_function("document.getElementById('pbgui-dialog-ovl')?.style.display !== 'none'")
+    assert dialog.is_visible()
+    text = dialog.inner_text()
+    for value in ('HYPE manual 20M', '20000000 iterations', 'RTX 3060', '$0.30/hour',
+                  '$5.00', '24 hours', '512 exact evaluations', 'Other queued jobs and Auto rent stay unchanged'):
+        assert value in text
+    assert not any(method == 'POST' and url.endswith('/start') for method, url in calls)
+    if not accept:
+        dialog.get_by_role('button', name='Cancel', exact=True).click()
+        page.wait_for_function("!document.querySelector('[title=Start]').disabled")
+        assert not held
+    else:
+        dialog.get_by_role('button', name='Start job', exact=True).click()
+        page.wait_for_function("document.getElementById('message').textContent === 'Starting this optimizer…'")
+        assert len(held) == 1
+        payload = held[0].request.post_data_json
+        assert payload == dict(review_id='e' * 32, payload_digest='f' * 64, accept_rental_and_cleanup=True)
+        row.locator('[title="Start"]').evaluate("node=>node.dispatchEvent(new MouseEvent('click'))")
+        assert len(held) == 1
+        held.pop().fulfill(json={'id': 'd' * 32, 'rental_state': 'creation_pending'})
+        page.wait_for_function("document.getElementById('message').textContent.includes('rental authorized')")
+    assert data['queue']['paused'] is True
+    assert other['status'] == 'ready'
+    assert not any(method == 'POST' and '/api/ai/' in url for method, url in calls)
+    assert not any(method == 'POST' and '/queue/start' in url for method, url in calls)
+
+
 @pytest.mark.parametrize('entry', ['detail', 'queue'])
 def test_job_stop_confirmation_lock_and_cancel(cloud_page, entry):
     """Both Stop entrances lock before confirmation, survive polling and release on Cancel."""

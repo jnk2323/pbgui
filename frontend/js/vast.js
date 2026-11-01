@@ -222,7 +222,7 @@
     const controller = new AbortController();
     controllers.add(controller);
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, (["/jobs/prepare", "/queue/start"].includes(path) || path.endsWith('/requeue')) ? 600000 : path.endsWith('/collect') ? 120000 : 30000);
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, (["/jobs/prepare", "/queue/start"].includes(path) || /^\/jobs\/[a-f0-9]{32}\/start$/.test(path) || path.endsWith('/requeue')) ? 600000 : path.endsWith('/collect') ? 120000 : 30000);
     try {
       const response = await fetch(apiBase + path, {
         credentials: 'same-origin', cache: 'no-store', ...options,
@@ -2951,8 +2951,47 @@
       if (!disposed) renderJob();
     }
   }
+  async function startSingleCloudJob(job) {
+    if (startingQueue || renting || workerAction || disposed) return;
+    startingQueue = true; startingJobId = job.id;
+    renderJob(); renderQueueMaybeDeferred();
+    message('Reviewing optimizer start…');
+    try {
+      const path = '/jobs/' + encodeURIComponent(job.id);
+      const review = await request(path + '/start-preview', {method:'POST'});
+      if (disposed) return;
+      const convergence = review.convergence || {};
+      const stopping = convergence.convergence_enabled
+        ? 'Stop after ' + String(convergence.convergence_patience) + ' exact evaluations without improvement above ' + String(convergence.convergence_tolerance_pct) + '%, after at least ' + String(convergence.convergence_min_exact) + ' exact evaluations.'
+        : 'Run until the iteration, time or budget limit.';
+      const confirmed = await window.PBGuiDialogs.confirm({
+        title:'Start this Vast optimizer?', confirmText:'Start job',
+        message:String(review.name) + '\n' + String(review.iterations) + ' iterations · ' + (review.exchanges || []).join(', ') +
+          '\n' + String(review.start_date || '') + ' → ' + String(review.end_date || '') +
+          '\nGPU: ' + String(review.gpu_name || 'Saved requirements') + ', up to $' + fmt(review.max_price_per_hour,2) + '/hour.' +
+          '\nBudget: $' + fmt(review.budget,2) + ' · Duration: up to ' + String(review.hours) + ' hours.' +
+          '\n' + stopping + '\nRent one GPU for this job and clean it up afterward. Other queued jobs and Auto rent stay unchanged.'
+      });
+      if (disposed || !confirmed) { if (!disposed) message(''); return; }
+      message('Starting this optimizer…');
+      await request(path + '/start', {method:'POST', body:JSON.stringify({
+        review_id:review.review_id, payload_digest:review.payload_digest, accept_rental_and_cleanup:true
+      })});
+      if (!disposed) {
+        await refreshJobs(job.id);
+        message('Job rental authorized. GPU preparation and optimizer progress appear automatically.');
+      }
+    } catch (error) {
+      if (!disposed) { message(error.message, true); if (typeof toast === 'function') toast(error.message, 'err'); }
+    } finally {
+      startingQueue = false; startingJobId = null;
+      if (!disposed) { renderJob(); renderQueueMaybeDeferred(); }
+    }
+  }
+
   async function startCloudQueue(job) {
     if (renting || startingQueue || workerAction || disposed || !supervision || (!savedPreferences && !(worker && !['none','deletion_verified'].includes(worker.rental_state))) || (job && deletingJobs.has(job.id))) return;
+    if (job && job.kind !== 'calibration') return startSingleCloudJob(job);
     if (savedPreferences?.auto_rent && !(await window.PBGuiDialogs.confirm({
       title:'Start GPU pool',
       message:'Automatically rent up to ' + savedPreferences.max_rentals + ' GPUs for queued jobs, with a budget target of $' + fmt(savedPreferences.budget,2) + ' per rental (up to $' + fmt(savedPreferences.max_rentals * savedPreferences.budget,2) + ' simultaneously)? Each rental lasts at most ' + savedPreferences.hours + ' hours. Replacement rentals may be started while jobs remain queued. Pause queue prevents new rentals; End rentals stops the pool.',
