@@ -148,13 +148,14 @@ async def provider_reply(chat, owner, body, *, instructions=INSTRUCTIONS, conten
     selection = selection if selection is not None else (chat.get_preferences(owner).get('selection') or {})
     provider, model = selection.get('provider'), selection.get('model')
     if provider == 'claude-code':
-        if body.screenshots:
-            raise AIChatError('Claude currently accepts text only')
         if not model:
             raise AIChatError('Select a Claude model first')
         await chat._validate_provider_model(owner, provider, model)
         content = content if content is not None else {'untrusted_issue_fields':body.model_dump(include={'subject','description','steps','expected','issue_type'})}
-        reply = await chat._claude_reply(owner, model, [{'role':'user','content':json.dumps(content)}], instructions,
+        blocks = [{'type': 'text', 'text': json.dumps(content)}]
+        blocks.extend({'type': 'image', 'source': {'type': 'base64', 'media_type': image.media_type,
+                                                   'data': image.data_base64}} for image in body.screenshots)
+        reply = await chat._claude_reply(owner, model, [{'role':'user','content':blocks if body.screenshots else blocks[0]['text']}], instructions,
                                         effort=selection.get('effort') or '')
         return reply, provider, model
     if provider not in {'chatgpt', 'opencode-go', 'opencode-zen'} or not model:

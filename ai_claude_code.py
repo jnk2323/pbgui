@@ -311,7 +311,10 @@ class ClaudeRuntime:
         tool_count, result = 0, None
         try:
             payload = {**payload, "executable": str(self.executable())}
-            process.stdin.write((json.dumps(payload, allow_nan=False) + "\n").encode())
+            request = (json.dumps(payload, allow_nan=False) + "\n").encode()
+            if len(request) > 32 * 1024 * 1024:
+                raise ClaudeCodeError("Claude conversation images exceed the supported request size. Start a new chat.")
+            process.stdin.write(request)
             await process.stdin.drain()
             async with asyncio.timeout(timeout):
                 while line := await process.stdout.readline():

@@ -225,7 +225,7 @@
     if (wanted.cloud && !cloudReady) return;
     restoring = true;
     const intent = intentGeneration;
-    let navigation = window.state?.navigationSeq;
+    const navigation = window.state?.navigationSeq;
     const current = () => !active && !suspended && intent === intentGeneration && saved.target === wanted && navigation === window.state?.navigationSeq;
     const discardAfterNavigation = () => {
       if (!suspended && intent === intentGeneration && saved.target === wanted && navigation !== window.state?.navigationSeq) {
@@ -235,8 +235,8 @@
     try {
       const valid = typeof wanted.filename === 'string' && !/[\\/\x00-\x1f\x7f]/.test(wanted.filename) && !['.', '..', ''].includes(wanted.filename);
       const row = valid && !wanted.cloud && !wanted.backtest && window.state.queue.find(item => item.filename === wanted.filename);
-      if (wanted.panel === 'queue') window.setPanel('queue');
-      navigation = window.state?.navigationSeq;
+      // Restore the companion window, never its former underlying page.
+      // The current URL/user navigation owns the destination.
       if (wanted.cloud && valid && /^[0-9a-f]{32}$/.test(wanted.filename)) {
         if (await window.PBGuiVast.openJobLog(wanted.filename, current)) return;
         if (!current()) { discardAfterNavigation(); return; }

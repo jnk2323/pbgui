@@ -9,6 +9,34 @@ from pathlib import Path
 import pytest
 
 
+def test_sdk_receives_ordered_image_blocks(monkeypatch):
+    """Images reach the SDK as image blocks alongside quoted conversation text."""
+    worker = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'runtime/claude_agent/worker.py'))
+    namespace = worker['main'].__globals__
+    captured = []
+    class Client:
+        """Capture the SDK request without contacting a provider."""
+        def __init__(self, options): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get_server_info(self): return {}
+        async def query(self, prompt):
+            captured.extend([message async for message in prompt])
+        async def receive_response(self):
+            yield worker['ResultMessage'](subtype='success', duration_ms=0, duration_api_ms=0,
+                is_error=False, num_turns=1, session_id='fixture', result='done')
+    monkeypatch.setitem(namespace, 'ClaudeSDKClient', Client)
+    monkeypatch.setitem(namespace, 'send', lambda event: None)
+    image = {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'fixture'}}
+    history = [{'role': 'user', 'content': [{'type': 'text', 'text': 'Inspect'}, image]},
+               {'role': 'assistant', 'content': 'Earlier reply'}]
+    asyncio.run(worker['main']({'mode': 'chat', 'model': 'fixture', 'executable': 'unused', 'history': history}, {}))
+    parts = captured[0]['message']['content']
+    assert parts[2] == image
+    assert json.loads(parts[1]['text']) == {'role': 'user', 'content': 'Inspect'}
+    assert json.loads(parts[3]['text']) == history[1]
+
+
 @pytest.mark.parametrize("payload", [
     b"[]\n", b'{"mode":\n', b'{"mode":"models","value":NaN}\n',
     b'{"mode":"models","value":1e999}\n', b'{"mode":"not-a-mode"}\n',

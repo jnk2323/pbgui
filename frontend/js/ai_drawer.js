@@ -742,7 +742,7 @@
     var profile = selectedProfile();
     root.querySelector('.pai-compose textarea').placeholder = provider === 'openrouter'
       ? 'Ask Jev to choose, rate, or judge yes/no from supplied data.'
-      : provider === 'claude-code' ? 'Type a message (text only)...' : 'Type a message, paste an image, or drop images here...';
+      : 'Type a message, paste an image, or drop images here...';
     refreshUsage();
     var select = root.querySelector('#pai-model');
     var current = preferred || select.value;

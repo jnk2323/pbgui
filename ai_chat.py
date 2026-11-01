@@ -2578,8 +2578,6 @@ class AIChatService:
         existing = self._owned_conversation(owner, conversation_id)
         selected_provider = str(provider or existing.provider).strip()
         clean_message = self._validate_message(message)
-        if selected_provider == "claude-code" and (images or any(item.get("images") for item in existing.messages)):
-            raise AIChatError("Claude currently accepts text only. Select an image-capable provider for images.")
         from support_debug_crypto import decoded_screenshots
         try:
             decoded_screenshots({"screenshots": images or []})
@@ -3530,6 +3528,11 @@ class AIChatService:
 
     async def _claude_chat(self, owner, model, history, conversation_id, effort=""):
         """Dispatch Claude tools through existing PBGui checks and proposal approvals."""
+        if any(item.get("images") for item in history):
+            try:
+                history = self.image_store.native_history(owner, conversation_id, history, "messages")
+            except (ValueError, OSError) as exc:
+                raise AIChatError("Chat images are unavailable or invalid") from exc
         tools = _tools_for_openrouter_connection(self.capabilities.messages_tools(), self.credentials.openrouter_configured(owner))
         allowed = {item["name"] for item in tools}
         seen_requests = {}

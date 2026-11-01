@@ -1570,6 +1570,11 @@
     openLogPanelResults();
   }
 
+  el('job-results').addEventListener('click', event => {
+    event.preventDefault();
+    if (!disposed) openCloudResults(selectedJob());
+  });
+
   function renderQueueOverview() {
     const banner = el('queue-rental');
     if (banner) {

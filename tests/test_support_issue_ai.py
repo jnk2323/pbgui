@@ -114,6 +114,18 @@ def test_claude_isolated_transport_never_uses_other_providers(monkeypatch):
     assert not chat._claude_reply.call_args.kwargs.get('tools')
 
 
+def test_claude_issue_draft_sends_screenshot():
+    """Issue screenshots are sent to Claude as image content without tools."""
+    from test_ai_chat_images import IMAGE
+    chat = chat_fixture('claude-code')
+    chat._claude_reply = AsyncMock(return_value='Synthetic reply')
+    body = ai.IssueDraftRequest(description='Issue', screenshots=[IMAGE])
+    asyncio.run(ai.provider_reply(chat, 'owner', body))
+    blocks = chat._claude_reply.call_args.args[2][0]['content']
+    assert blocks[1]['source']['data'] == IMAGE['data_base64']
+    assert not chat._claude_reply.call_args.kwargs.get('tools')
+
+
 @pytest.mark.parametrize('ending', ['success','disconnect','timeout','shutdown'])
 def test_request_ownership_and_cleanup(monkeypatch, ending):
     """Disconnect, timeout and service cancellation deterministically release provider work."""
