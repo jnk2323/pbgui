@@ -652,6 +652,33 @@ def test_remote_listing_refines_missing_collection_count(collection, monkeypatch
     assert 0 < listing.call_args.kwargs['timeout'] <= 120
 
 
+@pytest.mark.parametrize('override', [False, True])
+def test_scaled_collection_preserves_rental_reserve(collection, monkeypatch, override):
+    """Neither remote count refinement nor an explicit budget consumes reserve."""
+    c = collection
+    intent = c.store.read(c.lease, 'intent.json')
+    intent['deadline'] = time.time() + 190
+    write_json(c.store.directory(c.lease) / 'intent.json', intent)
+    c.store.update(c.identifier, pareto_count=None)
+    monkeypatch.setattr(vast_collect, 'collection_setting', lambda _name: None)
+    if override:
+        monkeypatch.setenv('PBGUI_COLLECT_TIMEOUT_SECONDS', '7200')
+    else:
+        monkeypatch.delenv('PBGUI_COLLECT_TIMEOUT_SECONDS', raising=False)
+    listing = Mock(return_value=1000)
+    monkeypatch.setattr(vast_transfer.WorkerConnection, 'pareto_file_count', listing)
+
+    def download(connection, final, timeout):
+        """Observe the real remaining allowance without any remote operation."""
+        assert 0 < timeout <= 10
+        native = ensure_private_directory(connection.directory / 'partial-results/optimize_results/run/pareto')
+        write_json(native / 'candidate.json', {})
+
+    monkeypatch.setattr(vast_transfer.WorkerConnection, 'collect', download)
+    assert c.http.post(c.url).status_code == 200
+    assert listing.call_count == (0 if override else 1)
+
+
 def test_timeout_during_batch_preparation_keeps_previous_commits(collection, monkeypatch):
     """The currently staged batch is discarded; earlier commits stay consistent."""
     c = collection

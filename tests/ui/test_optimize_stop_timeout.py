@@ -13,7 +13,7 @@ def test_start_date_stop_deadline(scenario):
     """Run real stop/poll/cleanup functions with deterministic timers and requests."""
     source = (Path(__file__).resolve().parents[2] / 'frontend/v7_optimize.html').read_text()
     functions = []
-    for name in ['stopOptimizeStartDateLookup','clearOptimizeStartDateProgress','refreshOptimizeStartDateLookup','scheduleOptimizeStartDatePoll','optimizeStartDateRequestDeadline']:
+    for name in ['stopOptimizeStartDateLookup','clearOptimizeStartDateProgress','refreshOptimizeStartDateLookup','scheduleOptimizeStartDatePoll','optimizeStartDateRequestDeadline','getOptimizeStartDateController']:
         start = re.search(r'^(?:async )?function '+name+r'\(',source,re.M).start()
         end = source.index('\n}',start)
         functions.append(source[start:end+2])
@@ -31,6 +31,11 @@ function renderOptimizeStartDateProgress() { rendered++; }
 function setOptimizeStartDateStatus(message,kind) { notices.push([message,kind]); }
 function applyOptimizeStartDateResult() { throw new Error('must not apply stopping result'); }
 function apiFetch() { requests++; return new Promise(resolve=>pendingResolve=resolve); }
+__SHARED__
+const PBGuiOhlcvStartDates=window.PBGuiOhlcvStartDates;
+let _optStartDateController=null, _optOhlcvStartDateRequestId=0;
+const optimizeEditorAdapter={isV8:true}, editorVisible=()=>true,
+ collectOptimizeStartLookupConfig=async()=>({}), optimizeOhlcvStartLookupSignature=()=>'';
 (async()=>{
  const stopping = stopOptimizeStartDateLookup(false);
  const deadline = timers.get(_optOhlcvStartDateRun.stopTimer);
@@ -61,4 +66,5 @@ function apiFetch() { requests++; return new Promise(resolve=>pendingResolve=res
  }
 })().catch(error=>{console.error(error);testResult.exitCode=1;});
 '''
+    script=script.replace('__SHARED__', (Path(__file__).resolve().parents[2] / 'frontend/js/ohlcv_start_dates.js').read_text())
     run_javascript(['-e',script],check=True,capture_output=True,text=True,timeout=10)

@@ -21,6 +21,73 @@ from api import backtest_v8
 from master_update_lock import acquire_master_update_lock
 
 
+@pytest.mark.parametrize('name,argument', [
+    ('start_ohlcv_start_date_lookup', {'config': {'backtest': {}}}),
+    ('get_ohlcv_start_date_lookup', 'owned-job'),
+    ('stop_ohlcv_start_date_lookup', 'owned-job'),
+])
+def test_start_date_shortcuts_reuse_optimize_handlers(monkeypatch, name, argument):
+    """Backtest forwards the exact request and session to the existing shared path."""
+    from api import optimize_v8
+    session = object()
+    received = []
+    result = {'status': 'completed'}
+
+    def shared(value, session):
+        """Record forwarding without invoking a runtime or starting a job."""
+        received.append((value, session))
+        return result
+
+    monkeypatch.setattr(optimize_v8, name, shared)
+    assert getattr(backtest_v8, name)(argument, session=session) is result
+    assert received == [(argument, session)]
+
+
+def test_start_date_shortcut_preserves_shared_http_error(monkeypatch):
+    """A missing shared job remains HTTP 404 rather than a success or generic error."""
+    from api import optimize_v8
+
+    def missing(job_id, session):
+        """Simulate the existing authenticated progress route's missing-job result."""
+        raise HTTPException(status_code=404, detail='OHLCV start-date lookup job not found')
+
+    monkeypatch.setattr(optimize_v8, 'get_ohlcv_start_date_lookup', missing)
+    with pytest.raises(HTTPException) as error:
+        backtest_v8.get_ohlcv_start_date_lookup('missing', session=None)
+    assert error.value.status_code == 404
+
+
+def test_start_date_lookup_requires_json_request_content_type(monkeypatch):
+    """Browser text/plain JSON fails body validation before any runtime job starts."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import optimize_v8
+    from api.auth import require_auth
+
+    app = FastAPI()
+    app.include_router(backtest_v8.router, prefix='/api/backtest-v8')
+    app.dependency_overrides[require_auth] = lambda: None
+    calls = []
+
+    def start(config):
+        """Record validated input without touching runtime data or a bot process."""
+        calls.append(config)
+        return {'job_id': 'synthetic', 'status': 'queued'}
+
+    monkeypatch.setattr(optimize_v8, 'start_pb8_ohlcv_start_date_job', start)
+    with TestClient(app) as client:
+        body = json.dumps({'config': {'backtest': {}}})
+        invalid = client.post('/api/backtest-v8/ohlcv-start-dates', content=body,
+                              headers={'Content-Type': 'text/plain;charset=UTF-8'})
+        assert invalid.status_code == 422
+        assert isinstance(invalid.json()['detail'], list)
+        assert calls == []
+        valid = client.post('/api/backtest-v8/ohlcv-start-dates', content=body,
+                            headers={'Content-Type': 'application/json'})
+        assert valid.status_code == 200
+        assert calls == [{'backtest': {}}]
+
+
 def test_result_pages_reuse_owned_discovery_and_new_load_sees_new_files(tmp_path, monkeypatch):
     """Only one scan is needed per load; filters/owners and new arrivals remain isolated."""
     root = tmp_path / 'results'

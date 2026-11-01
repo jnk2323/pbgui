@@ -437,11 +437,12 @@ def recover(root: Path, *, control=None) -> dict:
         return {"ok": True, "recovered": True, "backups": operation.backups()}
 
 
-def probe(root: Path, *, recovery=False) -> None:
+def probe(root: Path, *, recovery=False, online_cleanup=False) -> None:
     """Check admission without service changes; the actual worker must reacquire it."""
     root = Path(root).resolve()
-    with _owner_lock(root), acquire_master_runtime_lock(root), acquire_database_lock(root, exclusive=True, recovery=recovery):
-        recovery_record(root)
+    with _owner_lock(root), acquire_master_runtime_lock(root), acquire_database_lock(root, exclusive=not online_cleanup, recovery=recovery):
+        if recovery_record(root) and online_cleanup:
+            raise DatabaseBusyError("DB Tools recovery pending; recover this target before cleanup")
 
 
 def request_cancel(root: Path, operation_id: str) -> None:
@@ -458,6 +459,106 @@ def clear_cancel(root: Path, operation_id: str) -> None:
     if directory.exists():
         (directory / "cancel").unlink(missing_ok=True)
         directory.rmdir()
+
+
+class OnlineCleanup:
+    """Own online backups and row deletion without stopping ordinary writers.
+
+    The shared database lease excludes full restores; SQLite transactions own
+    row-write admission. No whole-database rollback may overwrite live writers.
+    """
+
+    online = True
+
+    def __init__(self, root, operation_id, cancel=None):
+        """Bind cancellation and the exact approved installation."""
+        self.root = Path(root).resolve()
+        self.id = _identifier(operation_id)
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.lease = None
+        self.thread_id = None
+        self.resources = ExitStack()
+
+    def check(self):
+        """Honor both API cancellation and the target-owned remote signal."""
+        path = self.root / "data" / "tmp" / "db-tools" / self.id / "cancel"
+        if self.cancel.is_set() or path.exists() or path.is_symlink():
+            raise MaintenanceCancelled("Database cleanup cancelled")
+
+    def assert_target(self, paths):
+        """Admit SQL only from this thread while its shared lease is live."""
+        if (self.thread_id != threading.get_ident() or self.lease is None
+                or self.lease._lock_file is None or set(paths) != set(DB_NAMES)
+                or any(Path(path).is_symlink() or Path(path).resolve() != self.root / "data" / name
+                       for name, path in paths.items())):
+            raise DatabaseBusyError("SQL cleanup requires its active target owner")
+        self.check()
+
+    def __enter__(self):
+        """Serialize manual maintenance while coexisting with scans and syncs."""
+        try:
+            self.resources.enter_context(_owner_lock(self.root))
+            self.resources.enter_context(acquire_master_runtime_lock(self.root))
+            self.lease = self.resources.enter_context(acquire_database_lock(self.root))
+            if recovery_record(self.root):
+                raise DatabaseBusyError("DB Tools recovery pending; recover this target before cleanup")
+            self.thread_id = threading.get_ident()
+            self.check()
+            return self
+        except BaseException:
+            self.resources.close()
+            raise
+
+    def __exit__(self, *args):
+        """Release admission only after SQL has closed all its connections."""
+        self.resources.close()
+
+
+def cleanup_online(root, request, *, cancel=None, progress=None):
+    """Back up live databases, then delete user rows under ordinary SQLite locks."""
+    from api.db_tools import delete_user_rows
+
+    with OnlineCleanup(root, request["id"], cancel) as owner:
+        owner.committed_rows = 0
+        paths = {name: owner.root / "data" / name for name in DB_NAMES}
+        owner.assert_target(paths)
+        backups = []
+        owner.snapshots = {}
+        directory = _private_directory(owner.root, ("data", "backup", "db-tools"))
+        try:
+            for name, path in paths.items():
+                owner.check()
+                if path.exists():
+                    if progress:
+                        progress.set_current(f"Back up {name} while database stays online")
+                    backup = directory / f"db-tools-{owner.id}-cleanup-{name}"
+                    backups.append(str(backup))
+                    backup_sqlite_database(path, backup, stable_snapshot=True)
+                    owner.snapshots[name] = backup
+                if progress:
+                    progress.advance(f"Backup checked for {name}")
+        except BaseException as exc:
+            # No SQL deletion has started. Remove only this attempt's snapshots
+            # so repeated backup failures do not accumulate full database copies.
+            for backup in backups:
+                Path(backup).unlink(missing_ok=True)
+            _sync_directory(directory)
+            if isinstance(exc, MaintenanceCancelled):
+                return {"ok": True, "cancelled": True, "backups": [], "deleted": {"total": 0, "tables": {}}}
+            raise
+        try:
+            deleted = delete_user_rows(paths, request["users"], request.get("cutoff_ms"), progress, _maintenance=owner)
+        except MaintenanceCancelled:
+            deleted = {"total": 0, "tables": {}, "cancelled": True}
+        finally:
+            if owner.committed_rows == 0:
+                # Successful backups are unnecessary if no deletion committed,
+                # including failures opening the bundle or taking its first lock.
+                for backup in backups:
+                    Path(backup).unlink(missing_ok=True)
+                backups.clear()
+                _sync_directory(directory)
+        return {"ok": True, "cancelled": deleted.pop("cancelled", False), "backups": backups, "deleted": deleted}
 
 
 def run(root: Path, request: dict, *, cancel=None, control=None, progress=None) -> dict:
@@ -477,20 +578,19 @@ def run(root: Path, request: dict, *, cancel=None, control=None, progress=None) 
             or any(char in user for char in ("/", "\\", "\x00")) for user in users
         ):
             raise ValueError("Select valid users before database maintenance")
+    if kind == "cleanup":
+        return cleanup_online(root, request, cancel=cancel, progress=progress)
     with Maintenance(root, request["id"], control=control, cancel=cancel) as owner:
         if kind == "install":
             owner.install(staged)
             result = {"restored": list(staged)}
         else:
-            from api.db_tools import copy_user_rows, delete_user_rows
+            from api.db_tools import copy_user_rows
 
             prepared = owner.prepare(staged)
             owner.touch(DB_NAMES)
             paths = {name: owner.root / "data" / name for name in DB_NAMES}
-            if kind == "cleanup":
-                result = {"deleted": delete_user_rows(paths, request["users"], request.get("cutoff_ms"), progress, _maintenance=owner)}
-            else:
-                result = {"copied": copy_user_rows(prepared, paths, request["users"], request["mode"], progress, _maintenance=owner)}
+            result = {"copied": copy_user_rows(prepared, paths, request["users"], request["mode"], progress, _maintenance=owner)}
             owner.check()
         result.update(ok=True, backups=owner.backups(), pbdata_was_running=owner.record["pbdata"] != "none")
     return result

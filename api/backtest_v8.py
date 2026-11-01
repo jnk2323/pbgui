@@ -128,6 +128,27 @@ def _result_page_paths(name, snapshot, session):
     return paths, token
 
 
+@router.post("/ohlcv-start-dates")
+def start_ohlcv_start_date_lookup(body: dict, session: SessionToken = Depends(require_auth)) -> dict:
+    """Use the same bounded inception lookup as the PB8 Optimize editor."""
+    from api.optimize_v8 import start_ohlcv_start_date_lookup as shared
+    return shared(body, session=session)
+
+
+@router.get("/ohlcv-start-dates/{job_id}")
+def get_ohlcv_start_date_lookup(job_id: str, session: SessionToken = Depends(require_auth)) -> dict:
+    """Read the shared editor lookup's progress and result."""
+    from api.optimize_v8 import get_ohlcv_start_date_lookup as shared
+    return shared(job_id, session=session)
+
+
+@router.delete("/ohlcv-start-dates/{job_id}")
+def stop_ohlcv_start_date_lookup(job_id: str, session: SessionToken = Depends(require_auth)) -> dict:
+    """Stop a lookup through the existing shared lifecycle."""
+    from api.optimize_v8 import stop_ohlcv_start_date_lookup as shared
+    return shared(job_id, session=session)
+
+
 @router.get("/scenario-templates")
 def get_scenario_templates(session: SessionToken = Depends(require_auth)) -> dict:
     """Expose the shared PB8 scenario catalog in the backtest namespace."""

@@ -276,3 +276,5 @@ Use isolated data and intercept browser requests; never run production actions m
 10. **Finish:** update EN/DE user guides and `releases/unreleased.md`; report changed areas and tests actually performed. Do not claim that an isolated component test proves the real menu works.
 
 Relevant test entry points include `tests/ui/test_sidebar_shared.py`, `tests/ui/test_help_sidebar_browser.py`, `tests/ui/test_help_request_generations.py` and `tests/test_help_coverage.py`. Extend focused tests for the affected page; observe the full-suite gate in AGENTS.md.
+
+PB8 Backtest and Optimize use `frontend/js/ohlcv_start_dates.js` for the shared start-date field and lookup lifecycle (start, progress polling, stop, timeout and stale-response cleanup). Pages supply only their editor collection, status and result-application adapters; keep the existing earliest/common-start semantics shared.

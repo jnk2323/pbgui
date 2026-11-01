@@ -72,7 +72,7 @@ def test_remote_owner_spans_backup_and_all_mutations(tmp_path, tools, remote, ki
     result = asyncio.run(tools._maintain_target("mock-target", request))
     assert result["ok"]
     assert _values(live) == ([None, None] if kind == "cleanup" else [(2,), (2,)])
-    assert remote.control.events == ["inspect", "stop", "start"]
+    assert remote.control.events == ([] if kind == "cleanup" else ["inspect", "stop", "start"])
     assert sum("remote_main" in script for script in remote.calls) == 1
     assert not list((tmp_path / "data" / "locks").glob("db-tools-remote-*.json"))
 

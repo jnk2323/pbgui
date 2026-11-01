@@ -571,16 +571,12 @@ def test_pb8_optimize_exposes_bounded_ohlcv_start_date_modes() -> None:
     """PB8 Optimize must offer compact earliest-any and common-all buttons beside start_date."""
     page = (ROOT / "frontend" / "v7_optimize.html").read_text(encoding="utf-8")
 
-    assert 'id="opted-ohlcv-start-mode"' not in page
-    assert "setOptimizeStartDateFromOhlcv(\\'earliest\\',this)" in page
-    assert "setOptimizeStartDateFromOhlcv(\\'all_markets\\',this)" in page
-    assert '>1st</button>' in page
-    assert '>All</button>' in page
-    assert "apiFetch('/ohlcv-start-dates'" in page
-    assert "apiFetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId))" in page
-    assert "{method: 'DELETE'}" in page
-    assert 'id="opted-ohlcv-start-progress-fill"' in page
-    assert 'id="opted-ohlcv-start-stop"' in page
+    shared = (ROOT / 'frontend/js/ohlcv_start_dates.js').read_text()
+    assert 'PBGuiOhlcvStartDates.renderField' in page
+    assert 'PBGuiOhlcvStartDates.create' in page
+    assert "options.fetch('/ohlcv-start-dates'" in shared
+    assert "options.fetch('/ohlcv-start-dates/' + encodeURIComponent(run.jobId))" in shared
+    assert 'all_markets' in shared and '>1st</button>' in shared and '>All</button>' in shared
     assert "signature !== optimizeOhlcvStartLookupSignature(currentConfig)" in page
     assert "scenarioGenerator: optimizeEditorAdapter.isV8" in page
 
@@ -4127,12 +4123,16 @@ def test_start_lookup_late_post_is_stopped_after_timeout() -> None:
     """A POST that returns its job ID after the deadline is stopped, not applied."""
     page = (ROOT / 'frontend/v7_optimize.html').read_text()
     functions = '\n'.join(_page_function(page, name) for name in (
-        'setOptimizeStartDateFromOhlcv', 'optimizeStartDateRequestDeadline'))
+        'setOptimizeStartDateFromOhlcv', 'optimizeStartDateRequestDeadline', 'getOptimizeStartDateController'))
     _run_node(textwrap.dedent(f"""
         const assert=browserAssert;
         let timers=new Map(), seq=0, resolvePost, deleted=[], status='';
         const window={{setTimeout(fn){{timers.set(++seq,fn);return seq;}},clearTimeout(id){{timers.delete(id);}}}};
         let _optOhlcvStartDateRun=null, _optOhlcvStartDateRequestId=0;
+        {(ROOT / 'frontend/js/ohlcv_start_dates.js').read_text()}
+        const PBGuiOhlcvStartDates=window.PBGuiOhlcvStartDates;
+        let _optStartDateController=null, _optOhlcvStartDatePollTimer=null;
+        const el=()=>({{style:{{}}}}), applyOptimizeStartDateResult=()=>{{}};
         const optimizeEditorAdapter={{isV8:true}};
         const setOptimizeStartDateStatus=x=>{{status=x;}}, setOptimizeStartDateControlsRunning=()=>{{}},
           renderOptimizeStartDateProgress=()=>{{}}, editorVisible=()=>true,

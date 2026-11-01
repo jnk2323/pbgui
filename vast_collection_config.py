@@ -4,6 +4,8 @@ import math
 from pbgui_purefunc import load_ini_snapshot
 from vast_provider import VastError
 
+SERVICE = "VastCollectionConfig"
+
 
 def collection_setting(name, *, integer=False):
     """Read a positive [vast] option from pbgui.ini, without changing it."""
