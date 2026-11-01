@@ -172,7 +172,7 @@ For PB8, permanent launch errors move only the affected row to an actionable err
 
 ### Log viewer
 
-The log window is nonmodal: the page behind it stays usable, including navigation and opening another queue log. Results and Pareto Explorer can navigate while the log remains open.
+The log window is nonmodal: the page behind it stays usable, including navigation and opening another queue log. Results and Pareto Explorer can navigate while the log remains open. Restoring the log after browser reload preserves the current page instead of returning to Queue.
 
 The log window keeps Results and Pareto Explorer above a compact status summary. **Run Details & Objectives** is initially collapsed. Opening details automatically moves the log down; collapsing them returns the space to the log. There is no draggable separator or reserved empty detail space. Status updates preserve open groups. Browser reload restores the available queue log, window position/size and open detail groups in this tab. Errors remain visible outside the collapsed details. Log data updates automatically. **Reset to default** restores the centered default window size and collapses all detail groups while preserving the selected log and unsaved rental inputs.
 

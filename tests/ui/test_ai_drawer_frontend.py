@@ -77,7 +77,7 @@ def _run_host_resolution(result, lost):
 def test_nav_lazy_loads_the_versioned_global_ai_drawer() -> None:
     """Every authenticated top-level page should receive one isolated drawer loader."""
     assert 'id="pbgui-ai-btn"' in NAV
-    assert "/app/js/ai_drawer.js?v=84" in NAV
+    assert "/app/js/ai_drawer.js?v=87" in NAV
     assert "/app/js/ai_usage.js?v=2" in NAV
     assert "/app/js/jev_transfer_preview.js?v=1" in NAV
     assert "jev_preview_id: jevPreviewId || null" in DRAWER
@@ -200,7 +200,8 @@ def test_drawer_uses_cookie_auth_persistent_history_and_detached_turns() -> None
     assert "preview.input_data" in DRAWER
     assert "preview.input_resource" in DRAWER
     assert "appendAnalysisResult" in DRAWER
-    assert "Start PB8 optimizer queue jobs" in DRAWER
+    assert "Start local PB8 optimizer queue jobs" in DRAWER
+    assert "Run normal Vast.ai optimizer" in DRAWER
     assert "exact reviewed PB8 optimizer queue jobs immediately" in DRAWER
     resolve = DRAWER.split("async function resolveProposal", 1)[1].split("async function newConversation", 1)[0]
     assert resolve.index("card.hidden = true") < resolve.index("await api('/proposals/")

@@ -11389,7 +11389,7 @@ window.addEventListener('pbgui:ai-backtest-compare-request', function(event) {
 });
 window.PBGUI_AI_PAGE_CONTEXT = function () {
   var entities = [];
-  if (editingConfig && editingConfig !== '__new__') entities.push({ kind: 'backtest_config', version: backtestEditorAdapter.version, name: editingConfig });
+  if (currentPanel !== 'results' && editingConfig && editingConfig !== '__new__') entities.push({ kind: 'backtest_config', version: backtestEditorAdapter.version, name: editingConfig });
   if (currentPanel === 'archive' && selectedArchiveName) entities.push({ kind: 'backtest_archive', version: backtestEditorAdapter.version, name: selectedArchiveName });
   if (currentPanel === 'queue') {
     getSelectedQueue().slice(0, 8).forEach(function(filename) {
@@ -11398,7 +11398,17 @@ window.PBGUI_AI_PAGE_CONTEXT = function () {
       }
     });
   }
-  if (entities.length < 8) {
+  if (currentPanel === 'results') {
+    getSelectedResults().slice(0, 8).forEach(function(path) {
+      var result = results.find(function(item) { return item.path === path; });
+      if (result && result.resource) entities.push({
+        kind: 'backtest_result', version: result.backtest_version || backtestEditorAdapter.version,
+        name: result.loop_compare_label || result.result_name || result.config_name || 'Selected backtest result',
+        resource: result.resource
+      });
+    });
+  }
+  if (entities.length < 8 && currentPanel !== 'results') {
     queueItems.filter(function(item) {
       return item.status === 'running' || item.status === 'backtesting';
     }).slice(0, 8 - entities.length).forEach(function(item) {

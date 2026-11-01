@@ -104,10 +104,12 @@ const handleError=e=>{throw e;};
   release();await first;assert.equal(state.livePanelRefreshInFlight,false);
   const second=refreshLiveResultsDuringRun();assert.equal(requests,2);release();await second;
   document.visibilityState='hidden';scheduleOptimizeLiveResults();await refreshLiveResultsDuringRun(true);
-  assert.equal(intervals.size,0);assert.equal(requests,2);
-  document.visibilityState='visible';state.queue=[];scheduleOptimizeLiveResults();await refreshLiveResultsDuringRun();
-  assert.equal(requests,2);
-  const final=refreshLiveResultsDuringRun(true);assert.equal(requests,3);release();await final;
+  assert.equal(intervals.size,0);assert.equal(requests,2);assert.equal(state.livePanelRefreshPending,true);
+  document.visibilityState='visible';state.queue=[];scheduleOptimizeLiveResults();
+  const resumed=refreshLiveResultsDuringRun();assert.equal(requests,3);release();await resumed;
+  assert.equal(state.livePanelRefreshPending,false);
+  await refreshLiveResultsDuringRun();assert.equal(requests,3);
+  const final=refreshLiveResultsDuringRun(true);assert.equal(requests,4);release();await final;
 })().catch(e=>{console.error(e);testResult.exitCode=1;});
 ''')
 

@@ -742,7 +742,7 @@
     var profile = selectedProfile();
     root.querySelector('.pai-compose textarea').placeholder = provider === 'openrouter'
       ? 'Ask Jev to choose, rate, or judge yes/no from supplied data.'
-      : provider === 'claude-code' ? 'Type a message (text only)...' : 'Type a message, paste an image, or drop images here...';
+      : 'Type a message, paste an image, or drop images here...';
     refreshUsage();
     var select = root.querySelector('#pai-model');
     var current = preferred || select.value;
@@ -1187,6 +1187,7 @@
     if (action === 'publish_github_issue') return 'Publish GitHub issue';
     if (action === 'save_ai_loop_config') return 'Save AI Loop definition';
     if (action === 'run_ai_loop') return 'Run AI Loop';
+    if (action === 'run_vast_optimizer') return 'Run normal Vast.ai optimizer';
     if (action === 'replace_ai_loop_gpu') return 'Replace GPU and continue loop';
     if (action === 'save_vast_preferences') return 'Change Vast.ai rental preferences';
     if (action === 'vast_host_block') return 'Change Vast.ai host exclusion';
@@ -1194,8 +1195,8 @@
     if (action === 'save') return 'Save PB8 optimizer config';
     if (action === 'save_and_queue') return 'Save PB8 config and add to queue';
     if (action === 'queue') return 'Add PB8 config to optimizer queue';
-    if (action === 'start_optimize_queue') return 'Start PB8 optimizer queue jobs';
-    if (action === 'queue_backtests') return 'Queue PB8 Pareto backtests';
+    if (action === 'start_optimize_queue') return 'Start local PB8 optimizer queue jobs';
+    if (action === 'queue_backtests') return 'Queue PB8 backtests';
     if (action === 'create_dashboard') return 'Create PBGui dashboard';
     if (action === 'save_dashboard_layout') return 'Save PBGui dashboard layout';
     if (action === 'python_analysis') return 'Run sandboxed Python analysis';
@@ -1204,6 +1205,7 @@
   }
 
   function proposalDetail(preview) {
+    if (preview.action === 'run_vast_optimizer') return 'Vast.ai · 1 normal optimizer · ' + String(preview.iterations || '') + ' iterations · ' + String(preview.gpu_name || '') + ' · up to USD ' + String(preview.max_price_per_hour) + '/h · USD ' + String(preview.budget) + ' budget · ' + String(preview.hours) + ' hours maximum · ' + ((preview.convergence || {}).convergence_enabled ? 'stop when no improvement' : 'iteration limit') + ' · paid rental and automatic cleanup; no AI Loop';
     if (preview.action === 'vast_host_block') return 'Machine ' + String(preview.machine_id) + ' · Job ' + String(preview.job_id) + ' · ' + String(preview.effect || '');
     if (preview.action === 'publish_github_issue') return String(preview.target || '') + ' · ' + String(preview.login || '') + (preview.encrypted_attachment ? ' · encrypted diagnostic attachment' : '') + (preview.reconcile_only ? ' · check previous publication only' : ' · public');
     if (['save_ai_loop_config', 'run_ai_loop', 'save_vast_preferences', 'replace_ai_loop_gpu'].includes(preview.action)) return String(preview.effect || '') + ' · ' + String(preview.changed_count || 0) + ' changes';
@@ -1211,11 +1213,15 @@
     if (preview.action === 'jev_analysis') return String(preview.version || '') + ' ' + String(preview.run_name || '') + ' - ' + String(preview.candidate_count || 0) + ' candidates assessed - ' + (preview.max_candidates == null ? 'Jev decides how many to mark' : 'mark at most ' + String(preview.max_candidates)) + ' - USD ' + String(preview.max_cost_usd || '') + ' maximum';
     if (preview.action === 'python_analysis') return String(preview.code_bytes || 0) + ' bytes of code - ' + String((preview.input_summary || {}).bytes || 0) + ' bytes of sanitized JSON input';
     if (preview.action === 'queue_backtests') {
+      if (preview.source_resource) return String(preview.source_name || 'Backtest result') + ' · ' +
+        String(preview.start_date || '') + ' → ' + String(preview.end_date || '') + ' · ' +
+        String(preview.job_count || 0) + ' separate jobs · ' + (preview.exchanges || []).join(', ') +
+        (preview.may_start_immediately ? ' - may start immediately' : '');
       var validationMode = String(preview.validation_mode || 'configured');
       if (validationMode !== 'configured') return String(preview.job_count || 0) + ' ' + validationMode.replace(/_/g, ' ') + ' validation jobs' + (preview.may_start_immediately ? ' - may start immediately' : '');
       return String(preview.job_count || 0) + ' backtest jobs across ' + String((preview.exchanges || []).length) + ' exchanges' + (preview.may_start_immediately ? ' - may start immediately' : '');
     }
-    if (preview.action === 'start_optimize_queue') return String(preview.job_count || 0) + ' exact queued PB8 optimizer jobs - starts immediately';
+    if (preview.action === 'start_optimize_queue') return 'Local PBGui host · ' + String(preview.job_count || 0) + ' exact queued PB8 optimizer jobs - starts immediately';
     if (preview.action === 'create_dashboard') return 'Create from template ' + String(preview.template || '');
     if (preview.action === 'save_dashboard_layout') return String((preview.layout || {}).rows || 0) + ' rows x ' + String((preview.layout || {}).columns || 0) + ' columns - ' + String(preview.changed_count || 0) + ' changes';
     return String(preview.changed_count || 0) + ' changes' + (preview.may_start_immediately ? ' - may start immediately' : '');
@@ -1437,7 +1443,7 @@
     state.resolvingProposalIds.add(proposalId);
     card.hidden = true;
     if (approve && preview.action !== 'publish_github_issue') {
-      var approvalDetail = ['save_ai_loop_config', 'run_ai_loop', 'save_vast_preferences', 'replace_ai_loop_gpu', 'vast_host_block'].includes(preview.action)
+      var approvalDetail = ['save_ai_loop_config', 'run_ai_loop', 'run_vast_optimizer', 'save_vast_preferences', 'replace_ai_loop_gpu', 'vast_host_block'].includes(preview.action)
         ? String(preview.effect || '')
         : preview.action === 'reviewed_config_change'
         ? String(preview.effect || '') + '. This approval applies only to the displayed changes; the chat remains analysis-only.'

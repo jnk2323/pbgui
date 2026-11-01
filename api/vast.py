@@ -27,6 +27,7 @@ from logging_helpers import human_log as _log
 from vast_credentials import VastCredentialStore
 from vast_provider import REFERRAL_URL, VastClient, VastError, gpu_name_matches, positive_id
 from vast_jobs import JobStore, config_name, digest, services_available, job_id, _warn_unreadable
+from vast_config_validation import MAX_ITERATIONS
 from vast_queue import CloudQueue, can_remove_job, blocked_machine_ids, offer_host_allowed
 from vast_hosts import host_history, set_host_preference, search_host_offers, offer_priority
 from file_lock import advisory_file_lock
@@ -259,7 +260,7 @@ class PrepareJobRequest(BaseModel):
     """A fresh job snapshot, with an explicit optional objective adjustment."""
     model_config = ConfigDict(extra="forbid")
     config_name: str = Field(min_length=1, max_length=160)
-    iterations: int = Field(default=512, ge=256, le=10_000_000)
+    iterations: int = Field(default=512, ge=256, le=MAX_ITERATIONS)
     workers: int = Field(default=4, ge=1, le=64)
     use_adg: bool = False
 
@@ -399,6 +400,14 @@ class StartJobRequest(BaseModel):
     budget: float = Field(default=1, ge=.1, le=100)
     accept_rental_and_cleanup: bool = False
     idle_seconds: int = Field(default=-1, ge=-1, strict=True)
+
+
+class SingleJobStartRequest(BaseModel):
+    """Confirm the exact owner-bound manual review for one frozen optimizer."""
+    model_config = ConfigDict(extra='forbid')
+    review_id: str = Field(pattern=r'^[a-f0-9]{32}$')
+    payload_digest: str = Field(pattern=r'^[a-f0-9]{64}$')
+    accept_rental_and_cleanup: bool = False
 
 
 @router.get("/gpu-preferences")
@@ -1360,6 +1369,32 @@ def _resume_auto_pool_after_requeue(queue: CloudQueue) -> None:
     except VastError as exc:
         queue.update(paused=True, pool_error=str(exc))
         _log(SERVICE, 'Requeued job is ready, but automatic GPU scheduling could not resume: ' + str(exc), level='WARNING')
+
+
+@router.post('/jobs/{identifier}/start-preview')
+def preview_single_job_start(identifier: str, response: Response,
+                             session: SessionToken = Depends(require_auth)) -> dict:
+    """Review one ready optimizer and its saved limits without renting or using AI."""
+    from vast_single_job import preview
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        return preview(CloudQueue(), job_id(identifier), session.user_id)
+    except VastError as exc:
+        raise _error(exc) from None
+
+
+@router.post('/jobs/{identifier}/start', status_code=202)
+def start_single_job(identifier: str, body: SingleJobStartRequest, response: Response,
+                     session: SessionToken = Depends(require_auth)) -> dict:
+    """Authorize one normal optimizer only after the concrete manual review."""
+    from vast_single_job import start
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        if not body.accept_rental_and_cleanup:
+            raise VastError('Confirm this job rental and automatic cleanup first', 422)
+        return start(CloudQueue(), job_id(identifier), session.user_id, body.review_id, body.payload_digest)
+    except VastError as exc:
+        raise _error(exc) from None
 
 
 @router.post("/queue/start", status_code=202)

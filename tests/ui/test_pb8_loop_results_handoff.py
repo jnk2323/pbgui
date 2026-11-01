@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.mark.parametrize('prefix', ['', '/nested'])
 @pytest.mark.parametrize('initial_error', [False, True])
-def test_loop_overview_renders_before_blocked_configs_and_details(prefix, initial_error):
+@pytest.mark.parametrize('advance_revision,late_round', [(False, False), (True, False), (True, True)], ids=['stable-revision', 'advancing-revision', 'late-round'])
+def test_loop_overview_renders_before_blocked_configs_and_details(prefix, initial_error, advance_revision, late_round):
     """A restored report and its list stay usable while independent reads remain pending."""
     browser_api = __import__('browser_driver')
     source = (ROOT / 'frontend/v7_optimize.html').read_text()
@@ -90,17 +91,36 @@ def test_loop_overview_renders_before_blocked_configs_and_details(prefix, initia
             other.fulfill(json=full[urlparse(other.request.url).path.rsplit('/',1)[-1]])
             page.wait_for_timeout(3500)
             selected = [route for route in held_details if urlparse(route.request.url).path.endswith(ids[0])][-1]
+        if advance_revision:
+            before = len(scans)
+            summaries[0].update(view_revision='2'*64, updated_at=1002, name='New overview metadata')
+            page.wait_for_function("document.getElementById('loops-results-table').textContent.includes('New overview metadata')")
+            assert len(scans) > before
+        if late_round:
+            older = {**full[ids[0]], 'cycles':[], 'observer_jobs':[]}
+            selected.fulfill(json=older)
+            page.wait_for_timeout(3500)
+            assert 'loop_cycle=1' in page.url and 'loop_tab=performance' in page.url
+            assert 'Loading' in page.locator('#loop-report-title').inner_text()
+            assert 'no longer available' not in page.locator('body').inner_text()
+            selected = [route for route in held_details if urlparse(route.request.url).path.endswith(ids[0])][-1]
+            full[ids[0]].update(view_revision='2'*64, updated_at=1002, name='New overview metadata')
         selected.fulfill(json=full[ids[0]])
         page.wait_for_selector('#loop-report-body [data-loop-result]')
         page.wait_for_function("!window.state.initialLoadPending")
         assert native_reads, 'native panels still load automatically after the visible report'
         assert page.locator('#loop-report-title').inner_text() == 'Round 2 · validated'
+        assert float(page.locator('html').get_attribute('data-pbgui-loop-first-detail-ms')) > 0
         assert page.locator('#loop-report-tab-performance').get_attribute('aria-selected') == 'true'
         assert 'Loading Loop report' not in page.locator('#loop-report-body').inner_text()
         assert 'Could not load Loop details' not in page.locator('#loop-report-body').inner_text()
         assert page.locator('#loops-results-table tr[data-key="'+ids[0]+'"]').is_visible()
         page.wait_for_timeout(3200)
-        assert len([route for route in held_details if urlparse(route.request.url).path.endswith(ids[0])]) == (2 if initial_error else 1)
+        if advance_revision:
+            page.wait_for_function("document.getElementById('loops-results-table').textContent.includes('New overview metadata')")
+            assert len([route for route in held_details if urlparse(route.request.url).path.endswith(ids[0])]) >= (2 if initial_error else 1)
+        else:
+            assert len([route for route in held_details if urlparse(route.request.url).path.endswith(ids[0])]) == (2 if initial_error else 1)
         assert page.locator('#loop-report-body [data-loop-result]').count() == 1
         assert not errors, errors
         browser.close()

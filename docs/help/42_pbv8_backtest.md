@@ -1,5 +1,7 @@
 # PBv8 Backtest
 
+With **Include page context** enabled, select a result and ask PBGui AI to backtest its executed config again over specified dates and separate exchanges. One approval queues one job per exchange, preserving strategy, risk, coins and override files. For “the full available period”, the assistant reads candle inventory first. The review shows exact dates, exchanges, source and autostart state. These standalone runs do not change the original result or an AI Loop's windows.
+
 Results appear progressively while later pages load. One browser load shares a single file-discovery pass across its pages; later pages do not rescan the complete result tree. New loads and automatic updates discover current files. If a page sequence expires, PBGui retries it once automatically while retaining the selected filter and requested Loop comparison.
 
 AI Loop result links load their filtered results before unrelated saved panels or archives. **Results** shows **Opening…** while checking the owned native job, and comparison shows loading feedback while equity data is read. **Back to AI Loop** restores the originating round/tab, expansion, selection and scroll position; current Loop data then updates automatically. If the Loop is no longer available, PBGui explains this in the original Queue/Results context. A request deadline reports an error rather than leaving navigation busy indefinitely.

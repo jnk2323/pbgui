@@ -152,8 +152,10 @@ _CAPABILITY_ACTIVITY = {
     "get_dashboard_layout": "Reading dashboard layout",
     "propose_pb8_optimizer_config": "Preparing a PB8 configuration proposal",
     "propose_queue_pb8_config": "Preparing a PB8 queue proposal",
+    "propose_vast_optimizer_run": "Preparing a normal Vast.ai optimizer run",
     "propose_start_pb8_optimizer_queue": "Preparing a PB8 optimizer start proposal",
     "propose_pareto_backtests": "Preparing a Pareto backtest proposal",
+    "propose_backtest_from_result": "Preparing a backtest result rerun proposal",
     "propose_dashboard_from_template": "Preparing a dashboard proposal",
     "propose_dashboard_layout": "Preparing a dashboard layout proposal",
     "propose_python_analysis": "Preparing a Python analysis proposal",
@@ -184,8 +186,10 @@ _CAPABILITY_RESULT_ACTIVITY = {
     "get_dashboard_layout": "Dashboard layout loaded; model is processing results",
     "propose_pb8_optimizer_config": "PB8 proposal prepared; model is processing results",
     "propose_queue_pb8_config": "PB8 queue proposal prepared; model is processing results",
+    "propose_vast_optimizer_run": "Vast.ai optimizer proposal prepared; model is processing results",
     "propose_start_pb8_optimizer_queue": "PB8 optimizer start proposal prepared; model is processing results",
     "propose_pareto_backtests": "Backtest queue proposal prepared; model is processing results",
+    "propose_backtest_from_result": "Backtest result rerun proposal prepared; model is processing results",
     "propose_dashboard_from_template": "Dashboard proposal prepared; model is processing results",
     "propose_dashboard_layout": "Dashboard layout proposal prepared; model is processing results",
     "propose_python_analysis": "Python analysis proposal prepared; model is processing results",
@@ -2574,8 +2578,6 @@ class AIChatService:
         existing = self._owned_conversation(owner, conversation_id)
         selected_provider = str(provider or existing.provider).strip()
         clean_message = self._validate_message(message)
-        if selected_provider == "claude-code" and (images or any(item.get("images") for item in existing.messages)):
-            raise AIChatError("Claude currently accepts text only. Select an image-capable provider for images.")
         from support_debug_crypto import decoded_screenshots
         try:
             decoded_screenshots({"screenshots": images or []})
@@ -2987,7 +2989,7 @@ class AIChatService:
             raise AIChatError("Invalid page context")
         safe_entities = []
         for item in entities:
-            if not isinstance(item, dict) or set(item) - {"kind", "version", "name", "result_id"}:
+            if not isinstance(item, dict) or set(item) - {"kind", "version", "name", "result_id", "resource"}:
                 raise AIChatError("Invalid page context")
             projected = {key: str(item.get(key) or "").strip() for key in ("kind", "version", "name")}
             if any(len(value) > 128 or any(ord(char) < 32 for char in value) for value in projected.values()):
@@ -2997,6 +2999,13 @@ class AIChatService:
                 if projected["kind"] != "optimizer_run" or not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", result_id):
                     raise AIChatError("Invalid page context")
                 projected["result_id"] = result_id
+            if 'resource' in item:
+                resource = item['resource']
+                if (projected['kind'] != 'backtest_result' or projected['version'] not in {'v7', 'v8'}
+                        or not isinstance(resource, str)
+                        or not re.fullmatch(r'pbgui://backtest/' + projected['version'] + r'/[0-9a-f]{32}', resource)):
+                    raise AIChatError("Invalid page context")
+                projected['resource'] = resource
             safe_entities.append(projected)
         if safe_entities:
             result["entities"] = safe_entities
@@ -3519,6 +3528,11 @@ class AIChatService:
 
     async def _claude_chat(self, owner, model, history, conversation_id, effort=""):
         """Dispatch Claude tools through existing PBGui checks and proposal approvals."""
+        if any(item.get("images") for item in history):
+            try:
+                history = self.image_store.native_history(owner, conversation_id, history, "messages")
+            except (ValueError, OSError) as exc:
+                raise AIChatError("Chat images are unavailable or invalid") from exc
         tools = _tools_for_openrouter_connection(self.capabilities.messages_tools(), self.credentials.openrouter_configured(owner))
         allowed = {item["name"] for item in tools}
         seen_requests = {}

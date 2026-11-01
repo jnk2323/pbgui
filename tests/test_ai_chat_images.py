@@ -17,6 +17,26 @@ CONVERSATION = 'b' * 32
 IMAGE = {'media_type': 'image/png', 'data_base64': base64.b64encode(PNG).decode()}
 
 
+def test_claude_receives_saved_images_from_owned_history(tmp_path, monkeypatch):
+    """Claude gets image bytes for saved conversation turns through the private store."""
+    async def scenario():
+        service = AIChatService(tmp_path / 'ai')
+        references = service.image_store.save(OWNER, CONVERSATION, [IMAGE])
+        captured = []
+        async def reply(owner, model, history, instructions, **kwargs):
+            captured.extend(history)
+            return 'Seen'
+        monkeypatch.setattr(service, '_claude_reply', reply)
+        try:
+            history = [{'role': 'user', 'content': 'Look', 'images': references}]
+            assert await service._claude_chat(OWNER, 'fixture', history, CONVERSATION) == 'Seen'
+            assert captured[0]['content'][1]['source']['data'] == IMAGE['data_base64']
+            assert history[0]['images'] == references
+        finally:
+            await service.shutdown()
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize('protocol,kind', [('responses', 'input_image'), ('chat', 'image_url'), ('messages', 'image')])
 def test_native_images_and_owner_boundary(tmp_path, protocol, kind):
     """Protocols receive real image bytes; references never become remote URLs or paths."""

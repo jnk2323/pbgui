@@ -274,7 +274,9 @@ def test_tool_catalog_separates_reads_from_proposals(tmp_path: Path) -> None:
         "propose_pb8_config_patch",
         "propose_queue_pb8_config",
         "propose_start_pb8_optimizer_queue",
+        "propose_vast_optimizer_run",
         "propose_pareto_backtests",
+        "propose_backtest_from_result",
         "propose_dashboard_from_template",
         "propose_dashboard_layout",
         "propose_jev_optimizer_analysis",
@@ -1456,10 +1458,11 @@ def test_pb8_queue_start_is_exact_approval_gated_and_idempotent(
         service = AICapabilityService(tmp_path / "capabilities")
 
         listed = service._list_pb8_optimizer_queue({"limit": 10})
+        monkeypatch.setattr(optimize_v8, "get_queue_config", lambda filename, session: {"config": {}})
         created = await service._propose_start_pb8_optimizer_queue(
             owner,
             conversation,
-            {"queue_ids": [items[0]["filename"], items[1]["filename"]]},
+            {"execution": "local", "queue_ids": [items[0]["filename"], items[1]["filename"]]},
         )
 
         assert listed["autostart"] is False
@@ -1496,10 +1499,11 @@ def test_pb8_queue_start_revalidates_status_before_any_launch(
         monkeypatch.setattr(optimize_v8, "get_queue", lambda session: {"items": copy.deepcopy(items)})
         monkeypatch.setattr(optimize_v8, "start_queue_item", lambda filename, body, session: starts.append(filename))
         service = AICapabilityService(tmp_path / "capabilities")
+        monkeypatch.setattr(optimize_v8, "get_queue_config", lambda filename, session: {"config": {}})
         created = await service._propose_start_pb8_optimizer_queue(
             owner,
             conversation,
-            {"queue_ids": [items[0]["filename"], items[1]["filename"]]},
+            {"execution": "local", "queue_ids": [items[0]["filename"], items[1]["filename"]]},
         )
         items[1]["status"] = "error"
         items[1]["started_at"] = time.time() + 1

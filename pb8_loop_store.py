@@ -439,9 +439,16 @@ def validate_change(record, config, overrides):
         validate_template_rubric(record, config, record.get('rubric'))
     if not all(isinstance(config.get(key), dict) for key in ('backtest', 'bot', 'live', 'optimize')):
         raise ValueError('A complete PB8 optimizer configuration is required')
+    from pb8_loop_config_contract import validate_worker_settings
+    validate_worker_settings(record, config)
     from ai_loop_search_limits import exposure_ceiling, validate_exposure_ceiling
     validate_exposure_ceiling(config, exposure_ceiling(record['settings']))
     validate_hsl_policy(record, config, overrides)
+    from pb8_metric_dependencies import metric_dependency_errors
+    dependency_errors = metric_dependency_errors(config, overrides)
+    if dependency_errors:
+        first = dependency_errors[0]
+        raise ValueError(first['path'] + ': ' + first['message'] + ' Preserve the reviewed HSL policy; choose a compatible metric.')
     if not record['settings']['scenario_enabled'] and scenario_state(config) != scenario_state(record['initial_config']):
         raise ValueError('Scenario Editor is disabled; its effective settings must remain unchanged')
     initial = record['initial_config']

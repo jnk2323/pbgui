@@ -368,6 +368,7 @@ class AICapabilityService:
         if len(encoded) > _MAX_CONFIG_BYTES:
             raise AICapabilityError("Tool arguments are too large")
         from ai_bot_log_tools import query as bot_log_query
+        from ai_vast_optimizer import propose as propose_vast_optimizer
         handlers = {
             "read_pbgui_support_evidence": self.support_tools.evidence,
             "get_github_support_status": self.support_tools.status,
@@ -416,7 +417,9 @@ class AICapabilityService:
             "propose_pb8_config_patch": self._propose_pb8_config_patch,
             "propose_queue_pb8_config": self._propose_queue_pb8_config,
             "propose_start_pb8_optimizer_queue": self._propose_start_pb8_optimizer_queue,
+            "propose_vast_optimizer_run": lambda owner, cid, args: propose_vast_optimizer(self, owner, cid, args),
             "propose_pareto_backtests": self._propose_pareto_backtests,
+            "propose_backtest_from_result": self._propose_backtest_from_result,
             "propose_dashboard_from_template": self._propose_dashboard_from_template,
             "propose_dashboard_layout": self._propose_dashboard_layout,
             "propose_jev_optimizer_analysis": self._propose_jev_optimizer_analysis,
@@ -643,6 +646,7 @@ class AICapabilityService:
                 self._persist_history(proposal, error="Approved analysis was cancelled")
             raise
         except Exception as exc:
+            await self._to_thread_uncancellable(self._retire_unstarted_optimizer_journal, proposal, exc)
             async with proposal.lock:
                 proposal.status = "failed"
                 proposal.execution_task = None
@@ -661,6 +665,57 @@ class AICapabilityService:
             self._persist_proposal(proposal)
             self._persist_history(proposal)
         return result
+
+    def _retire_unstarted_optimizer_journal(self, proposal: ActionProposal, error: Exception) -> bool:
+        """Finish a failed start only with native proof that no process/rental began."""
+        if proposal.action not in {'start_optimize_queue', 'run_vast_optimizer'}:
+            return False
+        journal = self._load_journal(proposal.id)
+        if not journal or journal.get('phase') == 'completed' or journal.get('started_queue_ids'):
+            return False
+        if (proposal.action == 'start_optimize_queue' and journal.get('phase') == 'prepared'
+                and (proposal.config or {}).get('execution') == 'local'
+                and (proposal.config or {}).get('jobs')
+                and all(job.get('input_digest') for job in proposal.config['jobs'])):
+            # Current local actions write starting_jobs BEFORE calling launch.
+            self._complete_journal(journal, {'proposal_id': proposal.id, 'status': 'failed',
+                'action': proposal.action, 'not_started': True, 'error': self._path_free_error(str(error))})
+            return True
+        try:
+            if proposal.action == 'start_optimize_queue':
+                from api import optimize_v8
+                jobs = (proposal.config or {}).get('jobs')
+                if not isinstance(jobs, list) or not jobs:
+                    return False
+                with optimize_v8._queue_lock():
+                    for job in jobs:
+                        queue_id = optimize_v8._validate_name(job['queue_id'])
+                        data = optimize_v8._read_json(optimize_v8._queue_file(queue_id))
+                        if (data.get('started_at') or optimize_v8._read_process_record(queue_id)
+                                or optimize_v8._pid_file(queue_id).exists()
+                                or optimize_v8._read_runner_state(queue_id)
+                                or data.get('status_override') not in (None, '', 'error')
+                                or (data.get('status_override') == 'error' and data.get('error_code') != 'prelaunch_failed')):
+                            return False
+                    self._complete_journal(journal, {'proposal_id': proposal.id, 'status': 'failed',
+                        'action': proposal.action, 'not_started': True, 'error': self._path_free_error(str(error))})
+            else:
+                from ai_vast_optimizer import CloudQueue
+                from vast_queue import single_job_worker_id
+                store = CloudQueue().store
+                worker_id = single_job_worker_id(proposal.id)
+                with advisory_file_lock(store.root / ('.ai-optimizer-' + proposal.id)):
+                    if (store.root / 'jobs' / worker_id).exists():
+                        worker = store.read(worker_id)
+                        intent = store.read(worker_id, 'intent.json')
+                        if worker.get('rental_state') != 'none' or intent.get('accepted_at'):
+                            return False
+                    self._complete_journal(journal, {'proposal_id': proposal.id, 'status': 'failed',
+                        'action': proposal.action, 'not_started': True, 'error': self._path_free_error(str(error))})
+        except Exception as exc:
+            _log(SERVICE, f'Unstarted optimizer action could not be verified: {type(exc).__name__}', level='WARNING')
+            return False
+        return True
 
     def _list_optimizer_configs(self, args: dict[str, Any]) -> dict[str, Any]:
         """List bounded PB7/PB8 optimizer config summaries without paths."""
@@ -2016,6 +2071,35 @@ class AICapabilityService:
             raise AICapabilityError("config must be an object")
         self._require_safe_draft(config)
         scenario = None
+        if args.get('suite_source_run_resource'):
+            if 'scenario_template' in args:
+                raise AICapabilityError('Choose either an existing Suite source or newly generated windows')
+            from api import optimize_v8
+            resource = self._resource_uri(args['suite_source_run_resource'], 'optimizer-run', 'v8')
+            raw = await self._to_thread_uncancellable(self._resolve_listed_resource, 'optimizer-run', 'v8', resource)
+            source = await self._to_thread_uncancellable(optimize_v8.get_result_config, str(raw.get('path') or ''), object())
+            source_config = source['config']
+            source_backtest = source_config.get('backtest') or {}
+            provenance = (source_config.get('pbgui') or {}).get('scenario_template')
+            if not source_backtest.get('suite_enabled') or not isinstance(provenance, dict):
+                raise AICapabilityError('This run has no complete saved Training/Holdout window plan; do not infer windows from a validation backtest')
+            from scenario_windows import build_validation_plan
+            try:
+                provenance = build_validation_plan(source_config)
+                if provenance is None:
+                    raise ValueError('Missing window contract')
+            except (ValueError, TypeError, KeyError) as exc:
+                raise AICapabilityError('The source run Suite does not match its saved Training/Holdout plan') from exc
+            config = copy.deepcopy(config)
+            backtest = config.setdefault('backtest', {})
+            for key in ('start_date', 'end_date', 'exchanges', 'suite_enabled', 'scenarios', 'reducer', 'aggregate'):
+                if key in source_backtest:
+                    backtest[key] = copy.deepcopy(source_backtest[key])
+                else:
+                    backtest.pop(key, None)
+            config.setdefault('optimize', {})['write_all_results'] = True
+            config.setdefault('pbgui', {})['scenario_template'] = copy.deepcopy(provenance)
+            scenario = {'provenance': provenance}
         if "scenario_template" in args:
             parameters = args["scenario_template"]
             if not isinstance(parameters, dict):
@@ -2040,9 +2124,10 @@ class AICapabilityService:
         if isinstance(current, dict):
             self._preserve_protected_config_fields(current, prepared)
         if scenario is not None:
-            # Authorize only metadata generated by PBGui from typed scenario
-            # parameters; arbitrary model-authored pbgui fields stay forbidden.
+            # Only native result metadata or typed generation parameters may
+            # authorize provenance; model-authored pbgui fields stay forbidden.
             prepared.setdefault("pbgui", {})["scenario_template"] = copy.deepcopy(scenario["provenance"])
+            prepared['pbgui'].pop('scenario_generator', None)
         from ai_loop_windows import stored_plan, verify_config
         try:
             reviewed = await self._to_thread_uncancellable(stored_plan, self.root.parent, owner, conversation_id)
@@ -2198,6 +2283,8 @@ class AICapabilityService:
         args: dict[str, Any],
     ) -> dict[str, Any]:
         """Create an approval proposal to queue one existing PB8 config."""
+        if args.get('execution') != 'local':
+            raise AICapabilityError('Choose execution=local explicitly, or use propose_vast_optimizer_run for Vast.ai')
         name = self._name(args.get("name"))
         return await self._create_proposal(owner, conversation_id, "queue", name, None)
 
@@ -2236,6 +2323,8 @@ class AICapabilityService:
         """Create an exact approval proposal to start existing queued PB8 optimizers."""
         from api import optimize_v8
 
+        if args.get('execution') != 'local':
+            raise AICapabilityError('Choose execution=local explicitly, or use propose_vast_optimizer_run for Vast.ai')
         raw_ids = args.get("queue_ids")
         if not isinstance(raw_ids, list) or not 1 <= len(raw_ids) <= 4:
             raise AICapabilityError("queue_ids must contain 1 to 4 PB8 queue IDs")
@@ -2255,9 +2344,14 @@ class AICapabilityService:
                 raise AICapabilityError(
                     f"PB8 optimizer queue item {self._name(item.get('name'))} is already {item.get('status')}"
                 )
-            jobs.append({"queue_id": queue_id, "name": self._name(item.get("name"))})
+            snapshot = optimize_v8.get_queue_config(queue_id, session=object())
+            if ((snapshot.get('config') or {}).get('pbgui') or {}).get('execution') == 'vast':
+                raise AICapabilityError('Vast.ai optimizer cannot start in the local queue; use propose_vast_optimizer_run')
+            jobs.append({"queue_id": queue_id, "name": self._name(item.get("name")),
+                         "input_digest": self._digest(snapshot)})
         preview = {
             "action": "start_optimize_queue",
+            "execution": "local",
             "version": "v8",
             "name": jobs[0]["name"] if len(jobs) == 1 else "PB8 optimizer queue batch",
             "job_count": len(jobs),
@@ -2280,7 +2374,7 @@ class AICapabilityService:
             conversation_id,
             "start_optimize_queue",
             preview["name"],
-            {"jobs": jobs},
+            {"jobs": jobs, "execution": "local"},
             preview,
             expected_digest=self._digest(jobs),
             create_only=False,
@@ -2582,6 +2676,72 @@ class AICapabilityService:
         return await self._create_custom_proposal(
             owner, conversation_id, "create_dashboard", name, payload, preview
         )
+
+    def _backtest_from_result_payload(self, args: dict[str, Any]) -> tuple[dict, dict]:
+        """Snapshot one managed PB8 result for independent, exchange-separated reruns."""
+        if set(args) != {'version', 'resource', 'start_date', 'end_date', 'exchanges'}:
+            raise AICapabilityError('Specify only the result, version, explicit dates and exchanges')
+        version = self._version(args)
+        if version != 'v8':
+            raise AICapabilityError('Backtesting from a result currently requires PB8')
+        resource = self._resource_uri(args.get('resource'), 'backtest', version)
+        exchanges = args.get('exchanges')
+        if (not isinstance(exchanges, list) or not 1 <= len(exchanges) <= 5
+                or any(not isinstance(exchange, str) for exchange in exchanges)):
+            raise AICapabilityError('Select between 1 and 5 backtest exchanges')
+        exchanges = [exchange.strip().lower() for exchange in exchanges]
+        if len(set(exchanges)) != len(exchanges):
+            raise AICapabilityError('Backtest proposal contains duplicate exchanges')
+        from api import backtest_v8
+
+        settings = backtest_v8.get_settings(session=object())
+        if any(exchange not in settings.get('exchange_options', []) for exchange in exchanges):
+            raise AICapabilityError('Backtest proposal contains an unsupported exchange')
+        raw = self._resolve_listed_resource('backtest', version, resource)
+        # The opaque identifier never grants arbitrary filesystem access.
+        path = str(raw.get('path') or '')
+        result_dir = backtest_v8._resolve_result_dir(path, allow_legacy=False)
+        source = backtest_v8.get_result_config(path, session=object())
+        if not isinstance(source, dict) or not source:
+            raise AICapabilityError('Backtest result config is unavailable')
+        name = 'rebacktest_' + resource.rsplit('/', 1)[-1][:16]
+        period = {'start_date': args.get('start_date'), 'end_date': args.get('end_date')}
+        config = _standalone_validation_config(source, period, name)
+        config['backtest']['exchanges'] = exchanges
+        overrides = backtest_v8._load_override_payloads(source, result_dir)
+        backtest_v8._validate_override_payloads(config, overrides)
+        # Validate the reviewed snapshot through the same native preparation as
+        # queue submission, without saving a config or creating a queue item.
+        backtest_v8.prepare_pb8_config(backtest_v8._normalize_config(copy.deepcopy(config), name),
+                                      base_config_path=str(backtest_v8._config_file(name)))
+        candidate = {'resource': resource, 'name': name, 'config': config,
+                     'override_configs': overrides}
+        payload = {'source_resource': resource, 'candidates': [candidate],
+                   'exchanges': exchanges, 'validation_mode': 'configured'}
+        preview = {
+            'action': 'queue_backtests', 'name': name, 'source_resource': resource,
+            'source_name': str(raw.get('config_name') or raw.get('result_name') or 'Backtest result')[:128],
+            'candidates': [{'resource': resource, 'name': name}],
+            'exchanges': exchanges, 'start_date': config['backtest']['start_date'],
+            'end_date': config['backtest']['end_date'], 'validation_mode': 'configured',
+            'job_count': len(exchanges), 'changed_count': len(exchanges),
+            'may_start_immediately': bool(settings.get('autostart')),
+            'changes': [{'path': 'backtests', 'kind': 'added', 'after': {
+                'source_result': resource,
+                'source_name': str(raw.get('config_name') or raw.get('result_name') or 'Backtest result')[:128],
+                'start_date': config['backtest']['start_date'],
+                'end_date': config['backtest']['end_date'], 'exchanges': exchanges,
+                'jobs': len(exchanges), 'strategy_parameters': 'Unchanged from source result',
+                'coin_override_files': sorted(overrides), 'suite_enabled': False}}],
+        }
+        return payload, preview
+
+    async def _propose_backtest_from_result(self, owner: str, conversation_id: str,
+                                          args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare one reviewed rerun proposal; never queue before user approval."""
+        payload, preview = await self._to_thread_uncancellable(self._backtest_from_result_payload, args)
+        return await self._create_custom_proposal(owner, conversation_id, 'queue_backtests',
+                                                  preview['name'], payload, preview)
 
     async def _propose_pareto_backtests(
         self, owner: str, conversation_id: str, args: dict[str, Any]
@@ -3674,6 +3834,10 @@ class AICapabilityService:
             "may_start_immediately": action in {"queue", "save_and_queue"}
             and str(settings.get("autostart", "False")).lower() == "true",
         }
+        if action in {"queue", "save_and_queue"}:
+            if (queue_config.get("pbgui") or {}).get("execution") == "vast":
+                raise AICapabilityError("Use propose_vast_optimizer_run for Vast.ai; this is the local optimizer queue")
+            preview["execution"] = "local"
         from ai_loop_windows import stored_plan, verify_config
         reviewed = stored_plan(self.root.parent, owner, conversation_id)
         if reviewed is not None:
@@ -3870,10 +4034,13 @@ class AICapabilityService:
             result = self.loop_tools.checked(self.loop_tools.execute, proposal)
             self._complete_journal(journal, result)
             return result
-        if proposal.action in {"queue_backtests", "create_dashboard", "save_dashboard_layout", "start_optimize_queue"}:
+        if proposal.action in {"queue_backtests", "create_dashboard", "save_dashboard_layout", "start_optimize_queue", "run_vast_optimizer"}:
             journal = self._load_journal(proposal.id) or self._journal_payload(proposal, phase="prepared")
             self._write_private_json(self.journal_root / f"{proposal.id}.json", journal)
-            if proposal.action == "queue_backtests":
+            if proposal.action == "run_vast_optimizer":
+                from ai_vast_optimizer import checked, execute
+                result = checked(execute, self, proposal)
+            elif proposal.action == "queue_backtests":
                 result = self._execute_pareto_backtests(proposal)
             elif proposal.action == "create_dashboard":
                 result = self._execute_dashboard_create(proposal)
@@ -3931,6 +4098,8 @@ class AICapabilityService:
                 journal["phase"] = "config_saved"
                 journal["updated_at"] = time.time()
                 self._write_private_json(self.journal_root / f"{proposal.id}.json", journal)
+        if proposal.action in {"queue", "save_and_queue"} and (prepared.get("pbgui") or {}).get("execution") == "vast":
+            raise AICapabilityError("Use propose_vast_optimizer_run for Vast.ai; local queue execution is prohibited")
         if proposal.action == "queue":
             options = optimize_v8._validate_launch_options(optimize_v8._runtime_options_from_config(prepared))
             queued = optimize_v8._create_queue_record(
@@ -4048,6 +4217,8 @@ class AICapabilityService:
         from api import optimize_v8
 
         jobs = (proposal.config or {}).get("jobs")
+        if (proposal.config or {}).get('execution') != 'local':
+            raise AICapabilityError('Local execution was not explicitly reviewed; create a new proposal')
         if not isinstance(jobs, list) or not 1 <= len(jobs) <= 4:
             raise AICapabilityError("PB8 optimizer start proposal is invalid")
         current = {
@@ -4063,6 +4234,10 @@ class AICapabilityService:
             item = current.get(queue_id)
             if item is None or self._name(item.get("name")) != expected_name:
                 raise AICapabilityError("PB8 optimizer queue changed after proposal creation")
+            snapshot = optimize_v8.get_queue_config(queue_id, session=object())
+            if (self._digest(snapshot) != job.get('input_digest')
+                    or ((snapshot.get('config') or {}).get('pbgui') or {}).get('execution') == 'vast'):
+                raise AICapabilityError('PB8 optimizer queue input or execution target changed after review')
             already_started = (
                 queue_id in completed
                 or (
@@ -4078,6 +4253,8 @@ class AICapabilityService:
             if queue_id not in completed:
                 item = current[queue_id]
                 if item.get("status") == "queued":
+                    journal['phase'] = 'starting_jobs'
+                    self._write_private_json(self.journal_root / f'{proposal.id}.json', journal)
                     response = optimize_v8.start_queue_item(queue_id, None, session=object())
                     started.append(
                         {"queue_id": queue_id, "name": str(job["name"]), "pid": response.get("pid")}
@@ -4351,6 +4528,7 @@ class AICapabilityService:
         if (isinstance(authorized_template, dict)
                 and ((before.get("pbgui") or {}).get("scenario_template") == authorized_template)):
             proposal.config.setdefault("pbgui", {})["scenario_template"] = copy.deepcopy(authorized_template)
+            proposal.config['pbgui'].pop('scenario_generator', None)
         changes = self._changed_entries(current, proposal.config)
         changed_paths = self._changed_paths(current, proposal.config)
         if isinstance(authorized_template, dict):
@@ -4718,11 +4896,13 @@ class AICapabilityService:
         from ai_loop_tools import tool_specs as loop_tool_specs
         from ai_bot_log_tools import tool_specs as bot_log_tool_specs
         from ai_support_tools import tool_specs as support_tool_specs
+        from ai_vast_optimizer import tool_specs as vast_optimizer_specs
         version_schema = {"type": "string", "enum": ["v7", "v8"]}
         return [
             *loop_tool_specs(),
             *bot_log_tool_specs(),
             *support_tool_specs(),
+            *vast_optimizer_specs(),
             {
                 "name": "propose_web_research",
                 "description": "When the user asks for internet/web research or current public evidence, draft a public-information-only research prompt and show it for approval inside this chat. Uses the current configured model/provider; unsupported connections return an explicit error without fallback. Does NOT search or execute anything. Exclude secrets, private account/host names, wallets, positions and complete configs. Results are initially display-only. If the user also requests Jev, include jev_questions for an automatic tool-free Jev analysis after research, covered by the same approval. For subsequent chat analysis use read_research_result; it permanently disables PBGui actions in this chat.",
@@ -5092,13 +5272,14 @@ class AICapabilityService:
             },
             {
                 "name": "propose_pb8_optimizer_config",
-                "description": "Validate a complete PB8 optimizer config and propose save or save-and-queue. For training and holdout windows, pass scenario_template generation parameters (same as preview_pb8_scenario_template) separately; PBGui generates and saves authoritative holdout metadata. Do not put pbgui metadata in config or a draft. Never executes without user approval.",
+                "description": "Validate a complete PB8 optimizer config and propose save or save-and-queue. To reuse an existing run's exact Training/Holdout suite, pass suite_source_run_resource; a Holdout backtest alone does not contain the original suite. For NEW windows pass scenario_template generation parameters instead. Do not put pbgui metadata in config or a draft. Never executes without user approval.",
                 "schema": AICapabilityService._object_schema(
                     {
                         "name": {"type": "string", "maxLength": 128},
                         "config": {"type": "object"},
                         "draft_id": {"type": "string", "minLength": 32, "maxLength": 32},
                         "scenario_template": {"type": "object", "description": "Same parameters as preview_pb8_scenario_template. For PBGUI_LOOP_WINDOWS_V1 requests use template=ai_loop_windows and copy version, use_holdout, training_windows, base dates and explicit windows exactly from the original request. Never regenerate reviewed dates."},
+                        "suite_source_run_resource": {"type": "string", "description": "Exact pbgui://optimizer-run/v8/... resource of the original training run whose complete saved Suite (Training + Holdout, base dates, exchanges and reducer) must be copied. Keep the provided config's strategy/risk parameters. Mutually exclusive with scenario_template. Never guess a run from similar metrics."},
                         "action": {"type": "string", "enum": ["save", "save_and_queue"]},
                     },
                     ["name", "action"],
@@ -5156,18 +5337,19 @@ class AICapabilityService:
             },
             {
                 "name": "propose_queue_pb8_config",
-                "description": "Propose queueing an existing PB8 optimizer config. Queueing does not mean the job started. Never executes without user approval.",
+                "description": "LOCAL execution only. Propose queueing an existing PB8 optimizer config on this PBGui host. For Vast.ai use propose_vast_optimizer_run instead. Queueing does not mean the job started. Never executes without user approval.",
                 "schema": AICapabilityService._object_schema(
-                    {"name": {"type": "string", "maxLength": 128}}, ["name"]
+                    {"name": {"type": "string", "maxLength": 128}, "execution": {"type": "string", "enum": ["local"]}}, ["name", "execution"]
                 ),
                 "effect": "execute",
                 "versions": ["v8"],
             },
             {
                 "name": "propose_start_pb8_optimizer_queue",
-                "description": "Propose immediately starting 1-4 exact existing queued PB8 optimizer jobs by IDs obtained from list_pb8_optimizer_queue. Never starts without user approval.",
+                "description": "LOCAL execution only, on this PBGui host. Propose immediately starting 1-4 exact local PB8 optimizer queue IDs from list_pb8_optimizer_queue. Never use for Vast.ai; use propose_vast_optimizer_run instead. Never starts without user approval.",
                 "schema": self._object_schema(
                     {
+                        "execution": {"type": "string", "enum": ["local"]},
                         "queue_ids": {
                             "type": "array",
                             "minItems": 1,
@@ -5175,11 +5357,25 @@ class AICapabilityService:
                             "items": {"type": "string", "maxLength": 128},
                         }
                     },
-                    ["queue_ids"],
+                    ["queue_ids", "execution"],
                 ),
                 "effect": "execute",
                 "resources": ["pbgui://optimizer-queue/v8/{opaque-id}"],
                 "versions": ["v8"],
+            },
+            {
+                "name": "propose_backtest_from_result",
+                "description": "Propose independent reruns of one selected PB8 Backtest result, including AI Loop Holdout/Full Time Range results. Use its exact backtest_result.resource from page context or list_backtests. Preserve executed strategy, risk, coins and coin overrides; set explicit inclusive start_date/end_date and queue one separate job per requested exchange in one user approval. Read get_candle_inventory first when the user asks for the full locally available period; do not assume the result's original dates cover it. No Pareto candidate or optimizer run is needed. Does not modify the source result, source config or AI Loop. Never queues or starts before user approval; autostart may start approved jobs.",
+                "schema": self._object_schema({
+                    "version": {"type": "string", "enum": ["v8"]},
+                    "resource": {"type": "string", "maxLength": 128},
+                    "start_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                    "end_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                    "exchanges": {"type": "array", "minItems": 1, "maxItems": 5, "uniqueItems": True,
+                                  "items": {"type": "string", "maxLength": 32}}
+                }, ["version", "resource", "start_date", "end_date", "exchanges"]),
+                "effect": "execute", "versions": ["v8"],
+                "resources": ["pbgui://backtest/v8/{opaque-id}"],
             },
             {
                 "name": "propose_pareto_backtests",
@@ -5846,6 +6042,7 @@ class AICapabilityService:
             }
         )
         return {
+            "execution": "local",
             "runtime": runtime,
             "override_files": [
                 {"name": name, "digest": cls._digest(payload)}

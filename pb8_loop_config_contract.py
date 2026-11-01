@@ -6,6 +6,46 @@ import copy
 from jsonschema import Draft202012Validator
 
 SERVICE = 'PB8Loop'
+WORKER_SETTINGS = ('gpu', 'n_cpus', 'population_size')
+
+
+def worker_reference(record):
+    """Use a trusted restoration snapshot for existing runs, otherwise their reviewed input."""
+    restored = record.get('worker_runtime')
+    if isinstance(restored, dict) and restored.get('version') == 1 and isinstance(restored.get('settings'), dict):
+        return {'optimize': restored['settings']}
+    return record['initial_config']
+
+
+def worker_settings_schema(config):
+    """Keep user-owned execution settings, including Auto/null and legacy aliases, fixed."""
+    optimize = config.get('optimize') or {}
+    return {'type': 'object',
+            'properties': {key: {'const': copy.deepcopy(optimize.get(key))} for key in WORKER_SETTINGS},
+            'required': [key for key in WORKER_SETTINGS if key in optimize]}
+
+
+def validate_worker_settings(record, config):
+    """Enforce execution ownership at backend boundaries, independently of any provider."""
+    validator = Draft202012Validator(worker_settings_schema(worker_reference(record)))
+    error = next(validator.iter_errors(config.get('optimize') or {}), None)
+    if error is not None:
+        path = '.'.join(str(part) for part in error.absolute_path) or 'worker settings'
+        raise ValueError('Worker execution settings are fixed at optimize.' + path
+                         + '; preserve the approved settings, including Auto/null. '
+                         'Change strategy bounds, scoring or permitted search filters instead.')
+
+
+def copy_worker_settings(source, target):
+    """Inherit reviewed worker settings rather than an optimizer winner's hardware edits."""
+    result = copy.deepcopy(target)
+    optimize = result.setdefault('optimize', {})
+    for key in WORKER_SETTINGS:
+        if key in source.get('optimize', {}):
+            optimize[key] = copy.deepcopy(source['optimize'][key])
+        else:
+            optimize.pop(key, None)
+    return result
 
 
 def variant_config_schema(record):
@@ -17,6 +57,7 @@ def variant_config_schema(record):
     schema = {'type': 'object', 'properties': {key: {'type': 'object'}
               for key in ('backtest', 'bot', 'live', 'optimize')},
               'required': ['backtest', 'bot', 'live', 'optimize'], 'additionalProperties': True}
+    schema['properties']['optimize'] = worker_settings_schema(worker_reference(record))
     fixed = {}
     if not record['settings']['scenario_enabled']:
         fixed.update(scenario_state(initial)['backtest'])

@@ -88,7 +88,7 @@ def log_page(request):
             elif path.endswith('/configs'):
                 route.fulfill(json={'configs': []})
             elif path.endswith('/results'):
-                route.fulfill(json={'results': []})
+                route.fulfill(json={'results': control.get('results', [])})
             elif path == '/api/optimize-' + version + '/settings':
                 if route.request.method == 'POST':
                     control['settings_posts'].append(route.request.post_data_json)
@@ -545,6 +545,50 @@ def test_background_page_and_result_navigation_stay_interactive(log_page):
     page.locator('#optlog-open-pareto-explorer').click()
     page.wait_for_function('state.panel === "results"')
     assert page.locator('#log-panel').is_visible()
+    assert not errors
+
+
+@pytest.mark.parametrize('action', ['optlog-open-results', 'job-results'])
+def test_cloud_result_actions_preserve_destination_after_poll_and_reload(log_page, action):
+    """Both log actions open the selected job without a Queue reload or snapback."""
+    page, data, _, errors, calls, _, control = log_page
+    result = dict(name='Test result', result='Test result', path='results/Test result')
+    control['results'] = [result]
+    data['jobs'][0]['result_path'] = result['path']
+    page.evaluate('window.testCloudPoll()')
+    page.wait_for_function('!document.getElementById("job-results").hidden')
+    open_cloud(page)
+    page.evaluate('loadResults()')
+    document_requests = calls.count('/api/optimize-v8/main_page')
+    page.locator('#' + action).click()
+    page.wait_for_function('state.panel === "paretos" && state.selectedResultPath === "results/Test result"')
+    page.evaluate('window.testCloudPoll()')
+    page.wait_for_timeout(120)
+    assert calls.count('/api/optimize-v8/main_page') == document_requests
+    assert page.locator('#panel-paretos').is_visible()
+    assert page.url.endswith('#paretos')
+    page.reload()
+    page.wait_for_function('!state.initialLoadPending && state.cloudLogId === "' + 'a' * 32 + '"')
+    assert page.locator('#panel-paretos').is_visible()
+    assert page.evaluate('state.selectedResultPath') == result['path']
+    assert page.url.endswith('#paretos')
+    assert not errors
+
+
+@pytest.mark.parametrize('log_page', ['v7', 'v8'], indirect=True)
+@pytest.mark.parametrize('destination', ['configs', 'results'])
+def test_restored_log_preserves_current_page(log_page, destination):
+    """A log saved on Queue must respect the page selected before browser reload."""
+    page, _, _, errors, _, _, _ = log_page
+    if page.evaluate('OPTIMIZE_VERSION === "v8"'):
+        open_cloud(page)
+    else:
+        page.evaluate("openLogPanel('job','Local job')")
+    page.locator('[data-panel="' + destination + '"]').click(position={'x': 10, 'y': 10})
+    page.reload()
+    page.wait_for_function('!state.initialLoadPending && document.getElementById("log-panel").classList.contains("visible")')
+    assert page.locator('#panel-' + destination).is_visible()
+    assert page.url.endswith('#' + destination)
     assert not errors
 
 

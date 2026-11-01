@@ -55,6 +55,10 @@
       var resultId = aiContextText(value.result_id, 200);
       if (/^[A-Za-z0-9_.-]{1,200}$/.test(resultId)) entity.result_id = resultId;
     }
+    if (entity.kind === 'backtest_result' && /^(v7|v8)$/.test(entity.version)) {
+      var resource = String(value.resource || '');
+      if (new RegExp('^pbgui://backtest/' + entity.version + '/[0-9a-f]{32}$').test(resource)) entity.resource = resource;
+    }
     return entity;
   }
 
@@ -1818,7 +1822,7 @@
     'system_vps_monitor': '/api/vps/main_page',
     'system_services':    '/api/services/main_page',
     'system_db_tools':    '/api/db-tools/main_page',
-    'help':               '/app/help.html?v=1779',
+    'help':               '/app/help.html?v=1780',
     'v7_run':             '/api/v7/main_page',
     'v7_backtest':        '/api/backtest-v7/main_page',
     'v7_optimize':        '/api/optimize-v7/main_page',
@@ -2155,7 +2159,7 @@
           return;
         }
         var script = document.createElement('script');
-        script.src = _appPath('/app/js/ai_drawer.js?v=84');
+        script.src = _appPath('/app/js/ai_drawer.js?v=87');
         script.onload = function () { _aiDrawerLoading = false; if (show && window.PBGuiAI && window.PBGuiAI.open) window.PBGuiAI.open(); window.dispatchEvent(new Event('pbgui:ai-ready')); };
         script.onerror = function () { _aiDrawerLoading = false; };
         document.head.appendChild(script);

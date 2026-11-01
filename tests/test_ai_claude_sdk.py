@@ -13,11 +13,14 @@ from ai_claude_code import ClaudeCodeError, ClaudeRuntime
 
 @pytest.mark.skipif(not ClaudeRuntime.available(), reason="Optional pinned Claude SDK is not installed")
 @pytest.mark.parametrize('loop_name', ['asyncio', 'uvloop'])
-@pytest.mark.parametrize('output_kind', ['text', 'structured', 'structured_retry', 'structured_failure',
+@pytest.mark.parametrize('output_kind', ['text', 'catalog', 'structured', 'structured_retry', 'structured_failure',
                                         'structured_missing', 'loop', 'loop_select', 'loop_bootstrap', 'loop_evaluate',
                                         'loop_evaluate_windows', 'loop_evaluate_scenario'])
 def test_installed_sdk_routes_native_mcp_tool_without_real_account(tmp_path, monkeypatch, loop_name, output_kind):
     """The real native client must round-trip MCP into Python without user data or API billing."""
+    full_catalog = output_kind == 'catalog'
+    if full_catalog:
+        output_kind = 'text'
     requests = []
     structured_attempts = []
     structured_value = {'result': 'PBGui fixture completed'}
@@ -151,10 +154,16 @@ def test_installed_sdk_routes_native_mcp_tool_without_real_account(tmp_path, mon
 
             async def reply():
                 """Exercise the production Python reply boundary and its native output-format option."""
+                tools = [{'name': 'fixture_tool', 'description': 'Synthetic offline test',
+                          'input_schema': {'type': 'object', 'properties': {'value': {'type': 'string'}},
+                                           'required': ['value']}}]
+                if full_catalog:
+                    from ai_capabilities import AICapabilityService
+                    tools.extend(object.__new__(AICapabilityService).messages_tools())
+                    assert len(tools) > 64
                 return await runtime.reply('a' * 32, model,
                     [{'role': 'user', 'content': 'Use fixture_tool once, then finish.'}], '', output_tokens=32768,
-                    tools=[{'name': 'fixture_tool', 'description': 'Synthetic offline test',
-                        'input_schema': {'type': 'object', 'properties': {'value': {'type': 'string'}}, 'required': ['value']}}],
+                    tools=tools,
                     handler=handler, on_event=event, handler_with_id=True, timeout_seconds=30,
                     output_schema=output_schema if output_kind != 'text' else None)
 
@@ -166,6 +175,12 @@ def test_installed_sdk_routes_native_mcp_tool_without_real_account(tmp_path, mon
                 expected = json.dumps(structured_value, separators=(',', ':')) if output_kind != 'text' else 'PBGui fixture completed'
                 assert answer == expected
             assert handled == ['fixture_tool']
+            if full_catalog:
+                from ai_capabilities import AICapabilityService
+                expected_tools = {'mcp__pbgui__' + tool['name']
+                                  for tool in object.__new__(AICapabilityService).messages_tools()}
+                offered = {tool['name'] for body in requests for tool in body.get('tools', [])}
+                assert expected_tools <= offered
             assert requests and not runtime.operations and not runtime.processes
             if output_kind != 'structured_failure':
                 assert any(value['event'] == 'usage' and value['context_window'] >= 256000 for value in events)

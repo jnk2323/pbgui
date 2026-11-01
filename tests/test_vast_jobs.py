@@ -856,6 +856,99 @@ def test_create_preparation_publishes_pending_job_before_snapshot_work(tmp_path)
     assert store.read(state['id'], 'control.json') == {'stop': False, 'cleanup': False}
 
 
+def test_single_job_account_change_is_rejected_before_account_or_rental_access(job, monkeypatch):
+    """A credential change after preflight cannot charge a different account."""
+    from types import SimpleNamespace
+    import vast_jobs
+    store, identifier, intent = job
+    store.update(identifier, kind='worker', status='ready', rental_state='none', workers=4)
+    intent['job_authorization'] = {'credential_generation': 1}
+    write_json(store.directory(identifier) / 'intent.json', intent)
+    monkeypatch.setattr(vast_jobs, 'services_available', lambda: True)
+    monkeypatch.setattr('vast_image.require_public_image', lambda image: None)
+    monkeypatch.setattr(vast_jobs, 'VastCredentialStore', lambda root: SimpleNamespace(
+        secrets=lambda: {'generation': 2, 'api_key': 'isolated-placeholder'}))
+    monkeypatch.setattr(vast_jobs, 'VastClient', lambda key: pytest.fail('No account access after account changed'))
+    offer = {'id': 123, 'price_hour_usd': .1, 'cuda_max_good': 13, 'disk_gb': 40, 'cpu_cores': 4}
+    with pytest.raises(VastError, match='credentials changed after single-job approval'):
+        store.start(identifier, offer, 1, 1)
+    assert store.read(identifier)['rental_state'] == 'none'
+
+
+@pytest.mark.parametrize('scoped', [False, True])
+def test_single_job_current_account_consent_is_independent_of_stale_pool_consent(job, monkeypatch, scoped):
+    """A single-job review owns its account; ordinary pool rentals retain their own gate."""
+    from types import SimpleNamespace
+    from vast_queue import CloudQueue
+    import vast_jobs
+    store, identifier, intent = job
+    store.update(identifier, kind='worker', status='ready', rental_state='none', workers=4)
+    CloudQueue(store).update(pool_enabled=True, pool_authorization={'credential_generation': 0})
+    if scoped:
+        intent['job_authorization'] = {'credential_generation': 1}
+    write_json(store.directory(identifier) / 'intent.json', intent)
+    monkeypatch.setattr(vast_jobs, 'services_available', lambda: True)
+    monkeypatch.setattr('vast_image.require_public_image', lambda image: None)
+    monkeypatch.setattr(vast_jobs, 'VastCredentialStore', lambda root: SimpleNamespace(
+        secrets=lambda: {'generation': 1, 'api_key': 'isolated-placeholder'}))
+
+    def account():
+        """Stop at the mocked account boundary before any rental side effect."""
+        raise RuntimeError('reached native account validation')
+
+    monkeypatch.setattr(vast_jobs, 'VastClient', lambda key: SimpleNamespace(account=account))
+    offer = {'id': 123, 'price_hour_usd': .1, 'cuda_max_good': 13, 'disk_gb': 40, 'cpu_cores': 4}
+    with pytest.raises(RuntimeError if scoped else VastError,
+                       match='native account validation' if scoped else 'start the GPU pool again'):
+        store.start(identifier, offer, 1, 1)
+    assert store.read(identifier)['rental_state'] == 'none'
+
+
+@pytest.mark.parametrize('change', ['stop', 'cleanup', 'reassigned', 'leased', 'unchanged'])
+def test_single_job_rechecks_child_after_account_preflight(job, monkeypatch, change):
+    """A stop or changed owner during slow account checks cannot commit a rental."""
+    from types import SimpleNamespace
+    import vast_jobs
+    store, identifier, intent = job
+    child_id = store.create_preparation('manual_child', 512, 4, False)['id']
+    authorization_id = 'b' * 32
+    store.update(child_id, status='ready', rental_authorization_id=authorization_id)
+    store.update(identifier, kind='worker', status='ready', rental_state='none', workers=4)
+    intent.pop('accepted_at')
+    intent.update(bundle_bytes=100, job_authorization={
+        'id': authorization_id, 'job_id': child_id, 'credential_generation': 1})
+    write_json(store.directory(identifier) / 'intent.json', intent)
+    monkeypatch.setattr(vast_jobs, 'services_available', lambda: True)
+    monkeypatch.setattr('vast_image.require_public_image', lambda image: None)
+    monkeypatch.setattr(vast_jobs, 'VastCredentialStore', lambda root: SimpleNamespace(
+        secrets=lambda: {'generation': 1, 'api_key': 'isolated-placeholder'}))
+    launched = []
+    monkeypatch.setattr(store, 'launch_service', lambda identifier, mode: launched.append(mode))
+
+    def account():
+        """Simulate another action completing while the account request is in flight."""
+        if change in {'stop', 'cleanup'}:
+            store.control(child_id, change)
+        elif change == 'reassigned':
+            store.update(child_id, rental_authorization_id='c' * 32)
+        elif change == 'leased':
+            store.update(child_id, lease_id='d' * 32)
+        return {'balance_usd': 100}
+
+    monkeypatch.setattr(vast_jobs, 'VastClient', lambda key: SimpleNamespace(account=account))
+    offer = {'id': 123, 'price_hour_usd': .1, 'cuda_max_good': 13, 'disk_gb': 40,
+             'cpu_cores': 4, 'download_gb_usd': 0, 'upload_gb_usd': 0}
+    if change == 'unchanged':
+        assert store.start(identifier, offer, 1, 1)['rental_state'] == 'creation_pending'
+        assert launched == ['run', 'guard']
+    else:
+        with pytest.raises(VastError, match='changed or was stopped before rental'):
+            store.start(identifier, offer, 1, 1)
+        assert store.read(identifier)['rental_state'] == 'none'
+        assert 'accepted_at' not in store.read(identifier, 'intent.json')
+        assert launched == []
+
+
 def test_large_input_manifest_keeps_control_record_limit(tmp_path):
     """Large shard manifests remain readable without widening mutable state records."""
     store = JobStore(tmp_path / 'vast')

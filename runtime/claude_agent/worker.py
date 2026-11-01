@@ -15,10 +15,14 @@ from claude_agent_sdk import (
 from jsonschema import Draft202012Validator
 
 MAX_LINE = 2 * 1024 * 1024
+MAX_REQUEST_LINE = 32 * 1024 * 1024
+# Catalogue capacity is independent of the parent's 64-call execution budget.
+MAX_TOOL_DEFINITIONS = 256
 MESSAGES = {
     "subscription": "Claude requires a subscription login; API billing is disabled.",
     "model": "Claude changed the selected model.",
     "tools": "Claude enabled an unexpected tool.",
+    "tool_catalog": "Claude tool catalogue is invalid or exceeds its size limit.",
     "provider": "Claude request failed. Check account access and usage limits.",
     "incomplete": "Claude did not complete the reply.",
     "structured": "Claude did not return the required structured decision.",
@@ -39,13 +43,13 @@ def send(value):
     sys.stdout.flush()
 
 
-def decode(line):
+def decode(line, limit=MAX_LINE):
     """Reject malformed/nonfinite messages before dispatching any work."""
     def invalid_constant(_value):
         """JSON constants such as NaN are not part of the protocol."""
         raise WorkerError("protocol")
 
-    if not line or len(line) > MAX_LINE:
+    if not line or len(line) > limit:
         raise WorkerError("protocol")
     value = json.loads(line, parse_constant=invalid_constant)
     if not isinstance(value, dict):
@@ -73,14 +77,16 @@ async def main(input_value, pending):
         Draft202012Validator.check_schema(output_schema)
         validator = Draft202012Validator(output_schema)
     specs = input_value.get("tools") or []
-    if not isinstance(specs, list) or len(specs) > 64:
-        raise WorkerError("tools")
+    if not isinstance(specs, list) or len(specs) > MAX_TOOL_DEFINITIONS:
+        raise WorkerError("tool_catalog")
     names = set()
     tools = []
     for spec in specs:
+        if not isinstance(spec, dict):
+            raise WorkerError("tool_catalog")
         name = spec.get("name")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", name) or name in names:
-            raise WorkerError("tools")
+            raise WorkerError("tool_catalog")
         names.add(name)
         schema = spec.get("input_schema") or {"type": "object", "properties": {}}
         Draft202012Validator.check_schema(schema)
@@ -153,8 +159,30 @@ async def main(input_value, pending):
                 raise WorkerError("model")
             send({"type": "result", "result": {"model": context["model"], "context": min(windows)}})
             return
-        await client.query("Conversation history (quoted user/assistant content):\n" +
-                           json.dumps(input_value.get("history") or [], allow_nan=False))
+        history = input_value.get("history") or []
+        parts = []
+        for item in history:
+            content = item.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "image":
+                        parts.append(block)
+                    elif block.get("type") == "text":
+                        parts.append({"type": "text", "text": json.dumps({"role": item.get("role"), "content": block.get("text", "")}, allow_nan=False)})
+                    else:
+                        raise WorkerError("protocol")
+            else:
+                parts.append({"type": "text", "text": json.dumps(item, allow_nan=False)})
+        if any(part.get("type") == "image" for part in parts):
+            async def prompt():
+                """Submit one user message with ordered, quoted history and image blocks."""
+                yield {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "text", "text": "Conversation history (quoted user/assistant content):"}, *parts]},
+                    "parent_tool_use_id": None}
+            await client.query(prompt())
+        else:
+            await client.query("Conversation history (quoted user/assistant content):\n" +
+                               json.dumps(history, allow_nan=False))
         reply = None
         async for event in client.receive_response():
             if isinstance(event, SystemMessage):
@@ -208,7 +236,7 @@ async def main(input_value, pending):
 
 async def run():
     """Own the input reader and pending calls for exactly one isolated SDK request."""
-    reader = asyncio.StreamReader(limit=MAX_LINE)
+    reader = asyncio.StreamReader(limit=MAX_REQUEST_LINE)
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
     pending = {}
@@ -232,7 +260,7 @@ async def run():
             operation.cancel()
 
     try:
-        value = decode(await reader.readline())
+        value = decode(await reader.readline(), MAX_REQUEST_LINE)
         operation = asyncio.create_task(main(value, pending), name="claude-sdk-request")
         input_task = asyncio.create_task(receive(), name="claude-parent-input")
         await operation

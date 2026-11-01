@@ -92,12 +92,18 @@ def rental_needed(queue: CloudQueue, authorization_id: str) -> bool:
     return len(claims) < len(waiting)
 
 
-def select_offer(queue: CloudQueue, settings: dict) -> dict:
+def select_offer(queue: CloudQueue, settings: dict, *, job_authorization: dict | None = None) -> dict:
     """Recheck fresh provider offers against saved requirements and active exclusions."""
     keys = ('gpu_name', 'max_price', 'min_vram', 'min_ram', 'min_cpu', 'min_tflops',
             'min_power_watts', 'min_reliability_pct', 'disk_gb', 'verified_only')
     preferences = {k: settings.get(k, 0) if k in ('min_power_watts', 'min_reliability_pct') else settings[k] for k in keys}
-    waiting = worker_compatible_jobs(queue.store, queue.waiting())
+    if job_authorization is not None:
+        from vast_queue import validated_job_authorization
+        scope = validated_job_authorization(job_authorization)
+        rows = [row for row in queue.waiting(authorization_id=scope['id']) if row['id'] == scope['job_id']]
+    else:
+        rows = queue.waiting()
+    waiting = worker_compatible_jobs(queue.store, rows)
     if not waiting:
         raise VastError('No prepared jobs match the current worker image; prepare compatible input first', 409)
     preferences['min_cpu'] = max(preferences['min_cpu'], max(

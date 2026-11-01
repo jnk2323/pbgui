@@ -85,6 +85,17 @@ def test_suite_scenario_and_reducer_validation(config):
     assert any('Aggregate' in row['message'] for row in validate_cloud_config(config))
 
 
+@pytest.mark.parametrize('alias', ['reducer', 'aggregate'])
+@pytest.mark.parametrize('reducer', ['mean', 'min', 'max', 'median', 'std'])
+def test_scalar_scoring_reducers_do_not_require_artificial_suites(config, alias, reducer):
+    """The pinned GPU scalar adapter exposes these reducer keys without a suite."""
+    config['backtest']['suite_enabled'] = False
+    config['optimize']['scoring'][0][alias] = reducer
+    before = copy.deepcopy(config)
+    assert validate_cloud_config(config) == []
+    assert config == before
+
+
 def test_invalid_gpu_tuning_and_bounds(config):
     """Malformed search ranges and GPU sizing fail before paying for a GPU."""
     config['optimize']['gpu'] = {'population_size':-1}
@@ -144,7 +155,9 @@ def test_multicoin_worker_boundary(config, count):
 @pytest.mark.parametrize('metric', sorted(__import__('vast_config_validation').METRICS))
 @pytest.mark.parametrize('group', ['scoring', 'limits'])
 def test_full_gpu_contract_is_allowed_for_scoring_and_limits(config, metric, group):
-    """Every name accepted by the worker's GPU validator reaches both editors."""
+    """Every GPU name works when its required side HSL controllers are enabled."""
+    for side in ('long', 'short'):
+        config['bot'][side]['hsl'] = {'enabled': True}
     config['optimize'][group][0]['metric'] = metric
     assert validate_cloud_config(config) == []
 

@@ -10,6 +10,7 @@
   function settleInitialView(force) {
     var row=rows.find(function(item){return item.id===selected;});
     if(!force&&isLoopPanel()&&(!overviewLoaded||reportView&&row&&row.summary_only))return;
+    if(!force&&reportView==='cycle'&&row&&row._detail_revision!==row.view_revision&&!cycleRows(row).some(function(cycle){return cycle.round===reportRound;}))return;
     initialViewWaiters.splice(0).forEach(function(resolve){resolve();});
   }
   function whenInitialViewReady() {
@@ -17,8 +18,10 @@
   }
   function navigationTiming(name, started) {
     var key='pbgui.loop.'+name;
+    var finished=performance.now();
     performance.clearMeasures(key);
-    performance.measure(key,{start:started,end:performance.now()});
+    performance.measure(key,{start:started,end:finished});
+    document.documentElement.setAttribute('data-pbgui-loop-'+name+'-ms',(finished-started).toFixed(1));
   }
   function saveLoopScroll() {
     var main=document.getElementById('panel-'+state.panel)||document.getElementById('main-content');
@@ -252,7 +255,7 @@
       var data = await response.json();
       if (!response.ok) {
         if(response.status===401){stopped=true;clearTimeout(timer);watchGeneration++;generation++;cancelLoopReads();}
-        var failure=new Error(typeof data.detail === 'string' ? data.detail : Array.isArray(data.detail) ? data.detail.map(function(item){return item.msg;}).join('; ') : data.detail && data.detail.message ? data.detail.message : 'Loop request failed');failure.status=response.status;throw failure;
+        var failure=new Error(typeof data.detail === 'string' ? data.detail : Array.isArray(data.detail) ? data.detail.map(function(item){return item.msg;}).join('; ') : data.detail && data.detail.message ? data.detail.message : 'Loop request failed');failure.status=response.status;failure.transient=[502,503,504].includes(response.status);throw failure;
       }
       return data;
     } catch(exc) {if(expired){var failure=new Error('Loop request timed out. Please try again.');failure.transient=true;throw failure;}if(exc instanceof TypeError)exc.transient=true;throw exc;}
@@ -639,7 +642,7 @@
     if(held.key===comparison.key&&['pending','complete'].includes(held.status))return;
     held.key=comparison.key;held.status='pending';
     var output=held.output;output.replaceChildren(element('p','Loading parameter diff…','muted-line'));
-    var token=++diffGeneration;if(diffRequest)diffRequest.abort();diffRequest=new AbortController();
+    var started=performance.now(),token=++diffGeneration;if(diffRequest)diffRequest.abort();diffRequest=new AbortController();
     fetch(base+'/'+encodeURIComponent(row.id)+'/diff?operation='+encodeURIComponent(diffOperation)+'&baseline='+encodeURIComponent(diffBaseline),{credentials:'same-origin',cache:'no-store',signal:diffRequest.signal}).then(async function(response){var data=await response.json();if(!response.ok)throw new Error(data.detail||'Diff unavailable');return data;}).then(function(data){
       if(token!==diffGeneration)return;
       if(!reportOverlay.classList.contains('is-open')){held.status='failed';return;}
@@ -647,6 +650,8 @@
       if(!data.fields.length)output.appendChild(element('p','No parameter changes.'));
       else reportTable(output,['Parameter','Before','After'],data.fields.map(function(field){return [field.path,JSON.stringify(field.before),JSON.stringify(field.after)];}));
       if(data.truncated)output.appendChild(element('p','Diff exceeds 4096 fields.','loop-error'));
+      navigationTiming('diff',started);
+      if(!document.documentElement.hasAttribute('data-pbgui-loop-first-diff-ms'))navigationTiming('first-diff',0);
     }).catch(function(exc){if(token===diffGeneration){held.status='failed';if(exc.name!=='AbortError')output.replaceChildren(element('p',exc.message,'loop-error'));}});
   }
   function updateReport() {
@@ -661,7 +666,14 @@
     }
     var cycles=cycleRows(row),cycle=cycles.find(function(item){return item.round===reportRound;});
     if(reportView==='run'&&['backtests','changes'].includes(reportTab)){reportTab='overview';reportNavigation();}
-    if(reportView==='cycle'&&!cycle){closeReport();uiErrorPanel=state.panel;uiError='The selected round is no longer available.';showMessages();return;}
+    if(reportView==='cycle'&&!cycle){
+      if(row._detail_revision!==row.view_revision){
+        reportTitle.textContent='Round '+(reportRound+1)+' · Loading…';reportBody.textContent='Loading Loop report…';
+        if(!reportOverlay.classList.contains('is-open')){reportOverlay.classList.add('is-open');reportOverlay.setAttribute('aria-hidden','false');reportWindow.fit();}
+        return;
+      }
+      closeReport();uiErrorPanel=state.panel;uiError='The selected round is no longer available.';showMessages();return;
+    }
     var diffCycle=reportTab==='changes'?(reportView==='cycle'?cycle:reportView==='initial'?cycles[0]:null):null;
     var comparison=diffCycle?normalizeDiff(row,diffCycle):null;
     if(!diffCycle||!comparison)resetDiff();
@@ -788,23 +800,28 @@
   function continueButton(parent,run,round){
     var control=button(parent,'Continue',function(){select(run.id);openReport(round==null?'run':'cycle',round==null?0:round,'overview');var count=reportBody.querySelector('input[aria-label="Additional optimizer runs"]');if(count){count.focus();count.scrollIntoView({block:'nearest'});}});control.className='act-btn loop-open';control.title=round==null?'Continue from the best exact comparison with 5, 10 or a custom number of runs.':'Continue from this round with 5, 10 or a custom number of runs.';
   }
-  var continueRounds=5,continuing=false,continuationBusyReset;
+  var continueRounds=5,continueHoursByRun=new Map(),continuing=false,continuationBusyReset;
   function continuationControls(parent,row,round,key){
     var form=element('div');form.dataset.continuationKey=key;parent.appendChild(form);
     var actions=element('div',undefined,'panel-toolbar');actions.appendChild(element('span',round==null?'Continue from best exact comparison':'Continue from this round’s best exact comparison'));
     var count=element('input');count.type='number';count.min='1';count.max='200';count.required=true;count.value=continueRounds;count.className='panel-input';count.style.width='90px';count.setAttribute('aria-label','Additional optimizer runs');count.oninput=function(){continueRounds=count.value;};actions.appendChild(count);
     var presets=[5,10].map(function(n){return button(actions,String(n)+' more',function(){continueRounds=n;count.value=n;});});
+    var hoursLabel=element('label');hoursLabel.className='panel-toolbar';hoursLabel.style.marginBottom='0';
+    var hoursText=element('span','Hours');hoursText.dataset.tip='Fresh total time allowance for the linked run, including pauses. Current rental and budget limits still apply.';hoursLabel.appendChild(hoursText);
+    var hours=element('input');hours.type='number';hours.min='0.1';hours.max='168';hours.step='any';hours.required=true;hours.className='panel-input';hours.style.width='90px';hours.setAttribute('aria-label','Continuation hours');
+    var initialHours=Number((row.settings||{}).hours);initialHours=Number.isFinite(initialHours)&&initialHours>=0.1?Number(initialHours.toFixed(6)):24;
+    hours.value=continueHoursByRun.has(row.id)?continueHoursByRun.get(row.id):String(initialHours);hours.oninput=function(){continueHoursByRun.set(row.id,hours.value);};hoursLabel.appendChild(hours);actions.appendChild(hoursLabel);
     var status=element('p','','muted-line');status.setAttribute('role','status');status.hidden=true;
-    function busy(value){action.disabled=value;count.disabled=value;presets.forEach(function(control){control.disabled=value;});action.textContent=value?'Starting…':'Continue';form.setAttribute('aria-busy',String(value));}
+    function busy(value){action.disabled=value;count.disabled=value;hours.disabled=value;presets.forEach(function(control){control.disabled=value;});action.textContent=value?'Starting…':'Continue';form.setAttribute('aria-busy',String(value));}
     continuationBusyReset=function(){busy(false);};
     var action=button(actions,'Continue',async function(){
-      if(continuing||!count.reportValidity())return;
+      if(continuing||!count.reportValidity()||!hours.reportValidity())return;
       var rounds=Number(count.value);continuing=true;busy(true);status.hidden=false;status.className='muted-line';status.textContent='Preparing the linked run…';
-      try{var ai=await PBGuiAI.ensureSelection();status.textContent='Starting the linked run…';var result=await request('/'+row.id+'/continue',{rounds:rounds,round:round,selection:ai,authorization:true});closeReport();selected=result.id;selectedRuns=new Set([result.id]);expanded.add(result.id);persistWorkflow();var url=new URL(location.href);url.searchParams.set('loop_id',result.id);history.replaceState(null,'',url);selectPanel('loops-queue');await poll();}
+      try{var ai=await PBGuiAI.ensureSelection();status.textContent='Starting the linked run…';var result=await request('/'+row.id+'/continue',{rounds:rounds,hours:Number(hours.value),round:round,selection:ai,authorization:true});closeReport();selected=result.id;selectedRuns=new Set([result.id]);expanded.add(result.id);persistWorkflow();var url=new URL(location.href);url.searchParams.set('loop_id',result.id);history.replaceState(null,'',url);selectPanel('loops-queue');await poll();}
       catch(exc){status.className='loop-error';status.textContent=exc.message;error(exc);}
       finally{continuing=false;busy(false);continuationBusyReset();}
     });busy(continuing);form.appendChild(actions);
-    form.appendChild(element('p','Starts a new linked run. Goals and current rental limits still apply; a used final holdout is not reused.','muted-line'));form.appendChild(status);
+    form.appendChild(element('p','New linked run · existing goals and rental limits.','muted-line'));form.appendChild(status);
   }
   function failureReason(row){return (row.failure||{}).reason||row.reason||row.last_error||'Failure reason was not recorded for this older run. See PBGui.log.';}
   function terminationReport(parent,row){
@@ -824,7 +841,7 @@
     var backgroundReports=row.final_holdout_policy==='observer_only'||row.final_validation_status==='observer_only';
     if(backgroundReports)confirmation='Independent background backtests';
     if(row.holdout_retryable)button(parent,'Retry unchanged final holdout',async function(){try{await request('/'+row.id+'/retry-holdout',{});await poll();}catch(exc){error(exc);}});
-    reportTable(parent,['Outcome','Details'],[['Search stopped',row.status==='failed'?failureReason(row):row.stop_reason||row.reason||row.status],['Best comparison',best?'Round '+(best.round==null?'unknown':best.round+1)+' · '+(best.candidate_id||'Selected'):'None'],['Hard numeric targets',assessment?(assessment.hard_targets_met===false?'Violated':assessment.hard_targets_met===true?'Met':'See goal evidence'):'Unknown'],[backgroundReports?'User evaluation':'Final confirmation',confirmation],['Start comparison',baseline?'Exact baseline recorded':'Not recorded for this older run']]);
+    reportTable(parent,['Outcome','Details'],[[row.ended?'Search stopped':'Search status',row.ended?(row.status==='failed'?failureReason(row):row.stop_reason||row.reason||row.status):row.status==='paused'?(row.ai_pause||{}).message||row.status:row.status],['Best comparison',best?'Round '+(best.round==null?'unknown':best.round+1)+' · '+(best.candidate_id||'Selected'):'None'],['Hard numeric targets',assessment?(assessment.hard_targets_met===false?'Violated':assessment.hard_targets_met===true?'Met':'See goal evidence'):'Unknown'],[backgroundReports?'User evaluation':'Final confirmation',confirmation],['Start comparison',baseline?'Exact baseline recorded':'Not recorded for this older run']]);
     if(best){reportTable(parent,['Goal / metric','Unchanged start','Best comparison','Change vs start'],assessment.goals.map(function(goal){var initial=baseline&&(baseline.assessment.goals||[]).find(function(item){return item.goal===goal.goal&&item.metric===goal.metric;});return [goal.goal+' · '+goal.metric,metricValue(initial&&initial.value,goal),metricValue(goal.value,goal),initial&&initial.value!=null?metricValue(goal.value-initial.value,goal):'Unknown'];}));}
     if(row.final_validation&&row.final_validation.length){parent.appendChild(element('h4','Final holdout'));row.final_validation.forEach(function(item){goalTable(parent,item.assessment.goals||[]);});}
     (row.jev_answers||[]).forEach(function(answer){parent.appendChild(element('p',typeof answer==='string'?answer:JSON.stringify(answer),'loop-analysis'));});
@@ -1321,17 +1338,32 @@
       var task=detailQueue.shift(),row=rows.find(function(item){return item.id===task.id;});
       if(!row||task.panel!==state.panel||task.navigation!==state.navigationSeq||row.view_revision!==task.revision||row._detail_revision===task.revision)continue;
       var previous=detailFlights.get(task.id);
-      if(previous){if(previous.revision!==task.revision)previous.controller.abort();continue;}
+      if(previous)continue;
       startDetail(task);
     }
   }
   function startDetail(task){
+    var started=performance.now();
     var flight={revision:task.revision,controller:new AbortController()};detailFlights.set(task.id,flight);detailActive++;
     request('/'+task.id,null,null,{signal:flight.controller.signal}).then(function(value){
       var index=rows.findIndex(function(item){return item.id===task.id;});
-      if(stopped||task.panel!==state.panel||task.navigation!==state.navigationSeq||index<0||rows[index].view_revision!==task.revision)return;
+      if(stopped||task.panel!==state.panel||task.navigation!==state.navigationSeq||index<0)return;
+      var current=rows[index];
+      if(current._detail_updated_at>value.updated_at)return;
       value._detail_revision=value.view_revision||task.revision;value.summary_only=false;
+      value._detail_updated_at=value.updated_at;
+      // A progress poll can advance while a valid snapshot is loading. Keep
+      // newer overview metadata and accept the detailed snapshot underneath it.
+      // Its own revision remains pending, so the next poll catches up normally.
+      if(current.updated_at>value.updated_at){
+        var metadata=Object.assign({},current);
+        ['jobs','observer_jobs','history','cycles','best','_detail_error','_detail_blocked_revision',
+          '_detail_revision','_detail_updated_at','summary_only'].forEach(function(key){delete metadata[key];});
+        metadata.settings=Object.assign({},value.settings,metadata.settings);
+        value=Object.assign({},value,metadata);
+      }
       rows[index]=value;render();restoreLoopScroll();restoreNativeLog();settleInitialView(false);
+      if(task.id===selected){navigationTiming('detail',started);if(!document.documentElement.hasAttribute('data-pbgui-loop-first-detail-ms'))navigationTiming('first-detail',0);}
     }).catch(function(exc){
       var row=rows.find(function(item){return item.id===task.id;});
       if(!stopped&&task.panel===state.panel&&task.navigation===state.navigationSeq&&row&&row.view_revision===task.revision&&exc.name!=='AbortError'){

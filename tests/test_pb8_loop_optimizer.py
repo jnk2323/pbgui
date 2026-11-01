@@ -554,7 +554,7 @@ def test_candidate_evidence_is_not_shortlisted_by_goal_score(record, tmp_path, m
 
 
 def test_invalid_gpu_variant_is_repaired_before_job_allocation(record, tmp_path, monkeypatch):
-    """Native GPU errors return to AI repair without launching a doomed job."""
+    """Worker edits return to AI repair before allocation; approved drift guards stay fixed."""
     store, row = record
     monkeypatch.setattr('pb8_loop_controller._log', lambda *args, **kwargs: None)
     async def isolated_operation(function, *args):
@@ -565,6 +565,7 @@ def test_invalid_gpu_variant_is_repaired_before_job_allocation(record, tmp_path,
         """Capture an isolated GPU input before initial AI variant selection."""
         value['settings']['execution'] = 'vast'
         value['initial_config'] = valid_gpu_config()
+        value['initial_config']['optimize']['gpu'] = {'validate_per_generation': 32, 'drift_window': 256}
         value.update(phase='bootstrap', rubric=RULE, bootstrap_candidates=[],
                      bootstrap={'status': 'evaluating', 'candidate_count': 0, 'sources': []})
     store.update(OWNER, row['id'], bootstrap)
@@ -574,17 +575,19 @@ def test_invalid_gpu_variant_is_repaired_before_job_allocation(record, tmp_path,
             changed = copy.deepcopy(current['initial_config'])
             changed['optimize']['gpu'] = {'validate_per_generation': 32,
                                           'drift_window': 256 if evidence.get('repair_error') else 128}
+            if evidence.get('repair_error'):
+                changed['optimize']['scoring'].append({'metric': 'drawdown_worst_strategy_eq', 'goal': 'min'})
             return {'variants': [{'config': changed, 'overrides': {}}]}
     backend = FakeBackend()
     controller = LoopController(tmp_path, store=store, backend=backend, ai=AI())
     asyncio.run(controller.tick(OWNER, row['id']))
     current = store.read(OWNER, row['id'])
     assert current['status'] == 'running' and current['phase'] == 'bootstrap'
-    assert 'at least 256' in current['repair_error']
+    assert 'Worker execution settings are fixed' in current['repair_error']
     assert current['jobs'] == [] and not backend.starts and not backend.prepared
     asyncio.run(controller.tick(OWNER, row['id']))
     current = store.read(OWNER, row['id'])
-    assert current['phase'] == 'optimize' and current['errors'] == 0
+    assert current['phase'] == 'optimize' and current['errors'] == 0, current.get('repair_error')
     assert len(current['jobs']) == 1 and current['repair_error'] is None
 
 

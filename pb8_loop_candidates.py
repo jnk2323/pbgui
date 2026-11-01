@@ -70,9 +70,15 @@ def ranking_criteria(record):
 
 def metric_value(data, metric, reducer, summary):
     """Read the requested training reducer; never substitute a mean for worst-window risk."""
-    block = (data.get('suite_metrics') or {}).get('metrics', {}).get(metric)
+    suite = data.get('suite_metrics') or {}
+    block = suite.get('metrics', {}).get(metric)
     if isinstance(block, dict):
         value = block.get('stats', {}).get(reducer)
+    elif suite or (data.get('backtest') or {}).get('suite_enabled'):
+        # Older suite artifacts use aggregate.stats; configured aggregates do
+        # not identify their reducer and cannot stand in for a missing bound.
+        value = (suite.get('aggregate') or {}).get('stats', {}).get(metric, {})
+        value = value.get(reducer) if isinstance(value, dict) else None
     else:
         value = summary.get(metric)
     return value if type(value) in (int, float) and math.isfinite(value) else None

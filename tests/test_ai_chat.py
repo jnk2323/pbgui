@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+
+
 from ai_chat import (
     AICredentialStore,
     AIChatError,
@@ -3047,3 +3049,16 @@ def test_page_action_timeout_retains_unconfirmed_action(tmp_path, monkeypatch):
         assert len(conversation.ui_actions) == 1
         await service.shutdown()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('version', ['v7', 'v8'])
+def test_page_context_retains_exact_selected_backtest_resource(version):
+    """Selected results keep a validated opaque identity through every provider's context boundary."""
+    entity = {'kind': 'backtest_result', 'version': version, 'name': 'Same display name',
+              'resource': f'pbgui://backtest/{version}/' + 'a' * 32}
+    assert AIChatService._validate_page_context({'entities': [entity]})['entities'] == [entity]
+    for bad in ('/private/result', 'pbgui://backtest/v6/' + 'a' * 32,
+                'pbgui://backtest/' + ('v8' if version == 'v7' else 'v7') + '/' + 'a' * 32,
+                entity['resource'] + '?token=fixture', None):
+        with pytest.raises(AIChatError, match='Invalid page context'):
+            AIChatService._validate_page_context({'entities': [{**entity, 'resource': bad}]})

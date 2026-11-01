@@ -258,6 +258,68 @@ def test_unchanged_report_cache_is_owned_and_invalidates_changed_state(record, m
         api._clear_list_cache()
 
 
+@pytest.mark.parametrize('failed', [False, True])
+def test_overlapping_detail_reads_share_snapshot_and_release_failures(record, monkeypatch, failed):
+    """Multiple tabs share one report build without blocking other owners or leaking failures."""
+    from concurrent.futures import Future
+    from api import loop_optimizer_v8 as api
+    store, row = record
+    original = api.projection
+    entered, release, followers = threading.Event(), threading.Event(), threading.Event()
+    waiters, builds = [], []
+    lock = threading.Lock()
+
+    class ObservedFuture(Future):
+        """Synchronize actual followers before releasing the expensive report build."""
+        def result(self, timeout=None):
+            with lock:
+                waiters.append(True)
+                if len(waiters) == 3:
+                    followers.set()
+            return super().result(timeout)
+
+    def projection(value):
+        """Hold a cold report to reproduce overlapping requests from several tabs."""
+        builds.append(True)
+        entered.set()
+        assert release.wait(4)
+        if failed:
+            raise ValueError('isolated report failure')
+        return original(value)
+
+    monkeypatch.setattr(api, '_controller', SimpleNamespace(store=store))
+    monkeypatch.setattr(api, 'Future', ObservedFuture)
+    monkeypatch.setattr(api, 'projection', projection)
+    api._clear_list_cache()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            first = pool.submit(api._detail_response, OWNER, row['id'])
+            assert entered.wait(2)
+            rest = [pool.submit(api._detail_response, OWNER, row['id']) for _ in range(3)]
+            try:
+                assert followers.wait(2)
+                with pytest.raises(FileNotFoundError):
+                    api._detail_response('f' * 32, row['id'])
+                store.update(OWNER, row['id'], lambda value: value.update(round=42))
+            finally:
+                release.set()
+            if failed:
+                for result in [first, *rest]:
+                    with pytest.raises(ValueError, match='isolated report failure'):
+                        result.result(timeout=3)
+            else:
+                bodies = [result.result(timeout=3).body for result in [first, *rest]]
+                assert all(body == bodies[0] for body in bodies)
+                assert json.loads(bodies[0])['round'] == row['round']
+        assert len(builds) == 1 and not api._detail_flights
+        monkeypatch.setattr(api, 'projection', original)
+        current = json.loads(api._detail_response(OWNER, row['id']).body)
+        assert current['round'] == 42
+    finally:
+        release.set()
+        api._clear_list_cache()
+
+
 def test_detail_projection_and_serialization_leave_api_loop_responsive(record, monkeypatch):
     """A slow history projection must run in a worker while the API loop progresses."""
     from api import loop_optimizer_v8 as api

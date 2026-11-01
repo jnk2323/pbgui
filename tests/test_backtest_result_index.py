@@ -76,6 +76,23 @@ def test_index_rebuilds_only_new_or_changed_results(tmp_path: Path, monkeypatch)
     assert oct(backtest_result_index._db_path().stat().st_mode & 0o777) == "0o600"
 
 
+@pytest.mark.parametrize('version', ['v7', 'v8'])
+def test_result_resources_match_managed_ai_identity_on_every_read(tmp_path, monkeypatch, version):
+    """Cold, warm and fallback summaries identify exact results without disclosing paths."""
+    from ai_capabilities import AICapabilityService
+    monkeypatch.setattr(backtest_result_index, 'PBGDIR', str(tmp_path))
+    analysis = _result(tmp_path, 'same-display-name', 1.4)
+    expected = AICapabilityService._virtual_uri('backtest', version, str(analysis.parent))
+    builder = _builder([])
+    for _ in range(2):
+        rows = backtest_result_index.load_indexed_results(version, [analysis], builder)
+        assert rows[0]['resource'] == expected
+        assert str(tmp_path) not in rows[0]['resource']
+    monkeypatch.setattr(backtest_result_index, '_connect', lambda: (_ for _ in ()).throw(sqlite3.OperationalError('fixture')))
+    monkeypatch.setattr(backtest_result_index, '_log', lambda *args, **kwargs: None)
+    assert backtest_result_index.load_indexed_results(version, [analysis], builder)[0]['resource'] == expected
+
+
 def test_page_reads_only_its_index_rows(tmp_path, monkeypatch):
     """A small page must not deserialize payloads for every unrelated result."""
     monkeypatch.setattr(backtest_result_index, 'PBGDIR', str(tmp_path))

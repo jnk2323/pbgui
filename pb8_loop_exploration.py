@@ -165,8 +165,9 @@ def _differences(before, after):
     """Classify meaningful changes in effective bounds, scoring or search filters."""
     old, new = _tunable_ranges(before), _tunable_ranges(after)
     bounds = [path for path, (low, high) in old.items() if path in new
-              and max(abs(new[path][0] - low), abs(new[path][1] - high)) / (high - low)
-              >= MATERIAL_BOUND_FRACTION]
+              and ((fraction := max(abs(new[path][0] - low), abs(new[path][1] - high)) / (high - low))
+                   >= MATERIAL_BOUND_FRACTION
+                   or math.isclose(fraction, MATERIAL_BOUND_FRACTION, rel_tol=1e-12))]
     approaches = []
     if old and len(bounds) >= min(MIN_BOUND_CHANGES, len(old)):
         approaches.append('bounds')
@@ -240,6 +241,8 @@ def exploration_policy(record):
     policy = {'mode': 'broad', 'allowed_approaches': ['bounds', 'scoring', 'limits'],
             'minimum_material_bound_changes': min(MIN_BOUND_CHANGES, len(ranges)),
             'material_fraction': MATERIAL_BOUND_FRACTION,
+            'minimum_endpoint_shifts': {path: (high - low) * MATERIAL_BOUND_FRACTION
+                                        for path, (low, high) in ranges.items()},
             'limit_change_fraction': LIMIT_CHANGE_FRACTION,
             'novel_after_non_improving_rounds': NOVEL_AFTER_STAGNATION,
             'stagnation': record.get('stagnation', 0),
@@ -254,6 +257,7 @@ def exploration_policy(record):
         policy['mode'] = 'adaptive'
         policy['minimum_material_bound_changes'] = 0
         policy['material_fraction'] = None
+        policy.pop('minimum_endpoint_shifts')
         policy['limit_change_fraction'] = None
         policy['novel_after_non_improving_rounds'] = None
         policy['experiment_selection'] = 'AI chooses order, combinations and controlled repetitions from training evidence'
@@ -282,12 +286,19 @@ def validate_exploration(record, config, *, stagnation_after=None):
     if not state['bounds'] and not state['scoring'] and not state['limits']:
         return []  # A completely fixed legacy search has no available experiment controls.
     if not approaches:
+        required = min(MIN_BOUND_CHANGES, len(state['bounds']))
+        proposed = _tunable_ranges(config)
+        changed = [(path, max(abs(proposed[path][0] - low), abs(proposed[path][1] - high)),
+                    (high - low) * MATERIAL_BOUND_FRACTION)
+                   for path, (low, high) in state['bounds'].items()
+                   if path in proposed and proposed[path] != [low, high]]
+        progress = '; '.join(f'{path}: {actual:.6g}/{threshold:.6g}'
+                             for path, actual, threshold in changed[:2]) or 'none'
         raise ValueError(
             f'Broad exploration requires a different search approach; found {len(bounds)} material bound changes. '
-            'Change two related tunable bounds by 25% of their previous width (one if only one exists), '
-            'or change the effective scoring objectives/basis, or add/remove an optional search filter '
-            'or move its threshold by at least 20%. Seeds, mutation, steps, ordering and labels do not count. '
-            'Preserve hard user-goal filters and explain the experiment.')
+            f'Need {required} active bounds changed by >=25% of prior width, different effective scoring/basis, '
+            'or a material optional-filter change (>=20% threshold shift). Population/seeds do not count. '
+            f'Endpoint shifts (actual/required): {progress}. Preserve hard filters and explain the experiment.')
     stagnation = record.get('stagnation', 0) if stagnation_after is None else stagnation_after
     if stagnation >= NOVEL_AFTER_STAGNATION:
         for job in jobs:

@@ -172,7 +172,7 @@ Bei PB8 setzt ein permanenter Startfehler nur die betroffene Zeile auf einen han
 
 ### Log-Viewer
 
-Das Logfenster ist nicht modal: Die Seite dahinter bleibt bedienbar, einschließlich Navigation und Öffnen eines anderen Queue-Logs. Results und Pareto Explorer können navigieren, während das Log geöffnet bleibt.
+Das Logfenster ist nicht modal: Die Seite dahinter bleibt bedienbar, einschließlich Navigation und Öffnen eines anderen Queue-Logs. Results und Pareto Explorer können navigieren, während das Log geöffnet bleibt. Die Log-Wiederherstellung nach Browser-Reload erhält die aktuelle Seite, statt zur Queue zurückzukehren.
 
 Im Logfenster stehen Results und Pareto Explorer oberhalb einer kompakten Statusübersicht. **Run Details & Objectives** ist zunächst eingeklappt. Aufgeklappte Details verschieben das Log automatisch nach unten; beim Einklappen erhält das Log den Platz zurück. Es gibt keine verschiebbare Trennleiste oder reservierte Leerfläche. Statusupdates erhalten die geöffneten Gruppen. Ein Browser-Reload stellt das noch verfügbare Queue-Log, Fensterposition/-größe und geöffnete Detailgruppen in diesem Tab wieder her. Fehler bleiben außerhalb der eingeklappten Details sichtbar. Die Logdaten aktualisieren sich automatisch. **Reset to default** stellt die zentrierte Standardgröße wieder her und klappt alle Detailgruppen ein; das ausgewählte Log und ungespeicherte Mieteingaben bleiben erhalten.
 

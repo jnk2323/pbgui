@@ -79,8 +79,8 @@ from pb8_config import (
 )
 from pbgui_purefunc import PBGDIR, PBGUI_SERIAL, PBGUI_VERSION, load_ini_section, pb7dir, pb8_runtime_status, save_ini_section
 from scenario_templates import ScenarioTemplateError, generate_scenario_template, list_scenario_templates
-from secure_files import atomic_write_private_text, ensure_private_directory, ensure_private_directory_tree
-from scenario_windows import validation_holdouts
+from secure_files import atomic_write_private_text, ensure_private_directory, ensure_private_directory_tree, read_regular_file_nofollow
+from scenario_windows import VALIDATION_PLAN_FILENAME, build_validation_plan, validation_holdouts
 from sweep_cycles import SWEEP_METRIC_NAMES, SWEEP_PLAN_FILENAME, build_sweep_plan, evaluate_sweep_cycles, validate_sweep_plan
 
 SERVICE = "OptimizeV8"
@@ -1203,6 +1203,44 @@ def _result_override_payloads(result_dir: Path, config: dict) -> dict[str, dict]
     if not _override_filenames(config):
         return {}
     return _load_override_payloads(config, result_dir)
+
+
+def _restore_result_window_plan(result_dir: Path, config: dict) -> dict:
+    """Reattach result-owned holdouts only after matching the native training suite."""
+    path = result_dir / VALIDATION_PLAN_FILENAME
+    if not path.exists() and not path.is_symlink():
+        return config
+    try:
+        if path.stat().st_size > 256 * 1024:
+            raise ValueError('Validation windows exceed the size limit')
+        template = json.loads(read_regular_file_nofollow(path, result_dir))
+        restored = copy.deepcopy(config)
+        backtest = restored.get('backtest') or {}
+        if not backtest.get('suite_enabled'):
+            raise ValueError('Saved validation windows require an enabled training suite')
+        # Native Recorder writes midnight timestamps; the visual plan uses ISO days.
+        for scenario in [backtest] + list(backtest.get('scenarios') or []):
+            for key in ('start_date', 'end_date'):
+                value = scenario.get(key)
+                if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T00:00:00(?:\.0+)?', value):
+                    scenario[key] = value[:10]
+        pbgui = restored.setdefault('pbgui', {})
+        pbgui['scenario_template'] = template
+        plan = build_validation_plan(restored)
+        if plan is None:
+            raise ValueError('Unsupported validation window contract')
+        pbgui['scenario_template'] = plan
+        parameters = plan['parameters']
+        pbgui['scenario_generator'] = {
+            **copy.deepcopy(parameters), **copy.deepcopy(parameters.get('sweep_policy') or {}),
+            'template': plan['template'],
+        }
+        return restored
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        _log(SERVICE, 'Cannot restore result-owned scenario windows', level='WARNING',
+             meta={'error_type': type(exc).__name__})
+        raise HTTPException(status_code=422, detail=
+            'Cannot restore saved Training/Holdout windows: validation metadata is invalid or does not match this run.') from exc
 
 
 def _checkpoint_resume_readiness(
@@ -5458,6 +5496,8 @@ def get_result_config(path: str, session: SessionToken = Depends(require_auth)) 
     with _result_lock():
         result_dir = _resolve_result_path(path)
         config = _recover_result_config(result_dir)
+        if config is not None:
+            config = _restore_result_window_plan(result_dir, config)
     if config is None:
         raise HTTPException(status_code=404, detail="No recoverable PB8 config found for result")
     try:
@@ -5503,7 +5543,7 @@ def queue_result_resume(body: dict, session: SessionToken = Depends(require_auth
                 status_code=422,
                 detail="Checkpoint cannot be resumed: " + "; ".join(readiness["reasons"]),
             )
-        config = copy.deepcopy(readiness["config"])
+        config = _restore_result_window_plan(result_dir, copy.deepcopy(readiness["config"]))
         runtime_options = (config.get('pbgui') or {}).get('optimize_runtime') or {}
         convergence_config = _result_convergence_config(result_dir,
             runtime_options.get('convergence_config', runtime_options))
@@ -6032,7 +6072,7 @@ def get_pareto_file(path: str, session: SessionToken = Depends(require_auth)) ->
         pareto = _resolve_result_path(path, require_directory=False)
         if not pareto.is_file() or pareto.parent.name != "pareto":
             raise HTTPException(status_code=400, detail="Path is not a managed PB8 pareto file")
-        config = _read_json(pareto)
+        config = _restore_result_window_plan(pareto.parent.parent, _read_json(pareto))
         response = {
             "config": config,
             "override_configs": _result_override_payloads(pareto.parent.parent, config),
