@@ -1377,6 +1377,7 @@ async def ai_execution_preview(loop_id: str, body: LoopAction, session: SessionT
 
 async def _loop_action_owned(owner, loop_id, body):
     """Run native owner-scoped actions for authenticated routes and reviewed AI tools."""
+    cancelled = threading.Event()
     try:
         if body.action == 'start':
             waiting = await asyncio.to_thread(_controller.store.read, owner, loop_id)
@@ -1469,6 +1470,8 @@ async def _loop_action_owned(owner, loop_id, body):
                     if binding.get('required'):
                         await asyncio.to_thread(EvidenceStore(_controller.store).resolve, snap, '/history/' + evidence_id.replace('~','~0').replace('/','~1'))
             def resume(current):
+                if cancelled.is_set():
+                    raise LoopAIPause('evidence_recovery', 'Resume authorization expired before publication; inspect status before retrying')
                 if current['status'] != 'paused' or current['control_generation'] != waiting['control_generation']:
                     raise ValueError('Loop changed while resuming')
                 current['settings'].update(validated)
@@ -1502,6 +1505,9 @@ async def _loop_action_owned(owner, loop_id, body):
         else:
             row = await asyncio.to_thread(_controller.action, owner, loop_id, body.action)
         return JSONResponse(projection(row), headers={'Cache-Control': 'no-store'})
+    except asyncio.CancelledError:
+        cancelled.set()
+        raise
     except Exception as exc:
         raise _error(exc) from exc
 
