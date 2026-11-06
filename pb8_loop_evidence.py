@@ -169,7 +169,7 @@ def select_findings(entries, record, budget=6000):
             'selection_version': SCHEMA, 'index_path': '/history/index'}, eligible
 
 
-def required_content(content):
+def required_content(content, *, selection_token_budget=None):
     """Keep every current goal/safety value; make historical reports optional."""
     raw = copy.deepcopy(content)
     relevant = SAFE_METRICS | {metric for rule in raw.get('rubric', []) for metric in rule['metrics']}
@@ -256,7 +256,67 @@ def required_content(content):
             candidate['metrics_row'] = index
         evidence[name + '_metrics'] = {'columns': columns, 'rows': rows, 'missing': missing}
     result['evidence'] = evidence
+    if stage == 'select' and selection_token_budget is not None:
+        return bounded_selection(result, selection_token_budget, raw['evidence'].get('candidates') or [])
     return result
+
+
+def bounded_selection(required, budget, originals):
+    """Keep round-robin rubric leaders; archive retains every exact candidate.
+
+    Only oversized select packages are projected. Rank finite labelled values in
+    each user criterion direction, using candidate ID as the deterministic tie.
+    Never delete safety fields from a retained candidate or change controller
+    qualification: these remain nominations, not independently qualified winners.
+    """
+    evidence = required['evidence']
+    candidates = evidence.get('candidates') or []
+    if not candidates or tokens(required) <= budget:
+        return required
+    original_indices = {item['id']: index for index, item in enumerate(originals)}
+    table = evidence['candidates_metrics']
+    rankings = []
+    for rule in required.get('rubric', []):
+        for metric in rule['metrics']:
+            if metric not in table['columns']:
+                continue
+            column = table['columns'].index(metric)
+            def rank(index):
+                value = table['rows'][candidates[index]['metrics_row']][column]
+                valid = type(value) in (int, float) and math.isfinite(value)
+                return (not valid, (-value if rule['direction'] == 'max' else value) if valid else 0,
+                        str(candidates[index]['id']))
+            rankings.append(sorted(range(len(candidates)), key=rank))
+    if not rankings:
+        rankings = [sorted(range(len(candidates)), key=lambda i: str(candidates[i]['id']))]
+    order = list(dict.fromkeys(index for group in zip(*rankings) for index in group))
+    def project(count):
+        selected = copy.deepcopy(required)
+        target = selected['evidence']
+        target['candidates'] = [copy.deepcopy(candidates[i]) for i in order[:count]]
+        rows, missing = [], {}
+        for i, candidate in enumerate(target['candidates']):
+            if candidate.get('source'):
+                candidate['source'] = {'evidence_path': '/data/evidence/candidates/' + str(original_indices[candidate['id']]) + '/source'}
+            old = candidate['metrics_row']
+            rows.append(table['rows'][old])
+            if str(old) in table['missing']:
+                missing[str(i)] = table['missing'][str(old)]
+            candidate['metrics_row'] = i
+        target['candidates_metrics'] = {'columns': table['columns'], 'rows': rows, 'missing': missing}
+        target['candidate_selection'] = {'version': 1, 'total': len(candidates), 'included': count,
+            'trimmed': len(candidates) - count, 'policy': 'round-robin rubric metric leaders; finite values first; ID ties',
+            'originals_path': '/data/evidence/candidates', 'token_budget': budget}
+        return selected
+    low, high = 0, len(candidates)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if tokens(project(middle)) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    # The final wire guard still rejects intrinsically oversized fixed instructions.
+    return project(max(1, low))
 
 
 class EvidenceStore:

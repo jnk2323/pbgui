@@ -12,7 +12,7 @@ import time
 import aiohttp
 
 from pb8_loop_evidence import (EvidenceStore, LoopAIPause, BootstrapWithoutAdvice, TOOL_SCHEMA,
-                               TOOL_DESCRIPTION, encode, sha, select_findings, required_content)
+                               TOOL_DESCRIPTION, encode, sha, tokens, select_findings, required_content)
 from pb8_loop_ai_policy import DecisionLedger, check_context, evidence_session
 from pb8_loop_config_contract import variant_config_schema, validate_variant_config
 from pb8_loop_dialog import OpenCodeDialog, read_sse, IncompleteResponse, StreamingUnavailable, NativeToolsUnavailable
@@ -32,6 +32,8 @@ def validate_snapshot_budget(record, snapshot, metadata):
     """A resume must actually fit the selected provider before changing runtime state."""
     from pb8_loop_ai import instructions_for_run
     profile = metadata['loop_profile']
+    if snapshot['data'].get('stage') == 'select' and tokens(snapshot['required']) > 20000:
+        snapshot = {**snapshot, 'required': required_content(snapshot['data'], selection_token_budget=20000)}
     session = evidence_session(None, snapshot, profile, native=record['settings']['provider'] in {'chatgpt', 'claude-code'})
     output = min(metadata.get('output_limit') or 32768, profile.get('output_tokens', 32768))
     instructions = instructions_for_run(record)['text'] + PROTOCOL
@@ -64,6 +66,9 @@ metric_basis.reducers states the basis of each flat metrics value/metrics_row co
 metric_statistics exposes separately labelled mean, min and max values; never call a
 mean drawdown the worst-window drawdown. Missing extrema remain unavailable, not zero.
 Native optimizer candidates are nominations, not independently CPU-qualified winners.
+When candidate_selection is present, candidates are a deterministic rubric-leader shortlist;
+it reports included/total/trimmed counts. Other candidates and exact source provenance
+remain available at its originals_path and source evidence_path. Do not claim all were read.
 For a hard upper drawdown limit across all windows use max, never mean. Historical
 prose and legacy_unlabelled values do not establish a reducer; use labelled reports.
 Only independently qualified current exact options can win. At evaluate, choose winner_operation
@@ -251,7 +256,8 @@ async def run_decision(ai, record, stage, evidence):
     snapshot = None
     if record.get('ai_snapshot_id') and record.get('ai_snapshot_stage') == stage and record.get('ai_snapshot_round') == record['round']:
         previous = await owned_thread(evidence_store.load, record['owner'], record['ai_snapshot_id'])
-        if previous['data'].get('input_digest') == input_digest:
+        if (previous['data'].get('input_digest') == input_digest
+                and not (stage == 'select' and tokens(previous['required']) > 20000)):
             snapshot = previous
     if snapshot is None:
         knowledge = await owned_thread(evidence_store.findings, record)
@@ -299,7 +305,7 @@ async def run_decision(ai, record, stage, evidence):
             content['evidence']['existing_results'] = selected
             content['historical_sources'] = preview
             await owned_thread(ai.store.update, record['owner'], record['id'], lambda row: row.update(bootstrap_evidence_preview=preview))
-        required = required_content(content)
+        required = required_content(content, selection_token_budget=20000)
         snapshot = await owned_thread(evidence_store.create, record, required, content, history)
         def bind(row):
             """Do not overwrite newer control state while a filesystem worker finishes."""
