@@ -2372,6 +2372,7 @@ def test_exact_qualification_rejects_partial_and_unknown_simulations(record, tmp
     assert obs['exact'] and obs['assessment']['simulation_complete'] is qualified
     assert obs['assessment']['comparable'] is qualified
     assert obs['assessment']['achieved'] is qualified
+    assert len(obs['assessment']['incomplete_windows']) == (0 if qualified else 1)
 
 
 def test_holdout_reservation_release_and_consumption_are_distinct(record):

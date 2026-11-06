@@ -653,6 +653,14 @@ class LoopBackend:
         scenarios = job.get('config', {}).get('backtest', {}).get('scenarios') or []
         expected = len(scenarios) if job.get('config', {}).get('backtest', {}).get('suite_enabled') and scenarios else 1
         complete = len(per_report) >= expected and all(item.get('backtest_completion_ratio', 0) >= .999999 for item in per_report)
+        assessment['incomplete_windows'] = [
+            {'label': context.get('label'),
+             'completion_ratio': values.get('backtest_completion_ratio'),
+             'effective_start_date': context.get('effective_start_date'),
+             'effective_end_date': context.get('effective_end_date')}
+            for values, context in zip(per_report, contexts)
+            if values.get('backtest_completion_ratio', 0) < .999999
+        ]
         assessment['simulation_complete'] = complete
         assessment['comparable'] = assessment['comparable'] and complete
         assessment['achieved'] = assessment['achieved'] and complete

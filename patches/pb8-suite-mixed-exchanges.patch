@@ -1,0 +1,52 @@
+diff --git a/src/suite_runner.py b/src/suite_runner.py
+index a85df8aaf..51a3a641a 100644
+--- a/src/suite_runner.py
++++ b/src/suite_runner.py
+@@ -2148,6 +2148,16 @@ def _suite_session_inputs(
+     return inputs, run_configs, sorted(coins), sorted(sources)
+ 
+ 
++def _dataset_available_exchanges(datasets):
++    """Return real exchanges, including every combined dataset contributor."""
++    return sorted({
++        exchange
++        for key, dataset in datasets.items()
++        for exchange in (dataset.available_exchanges if key == "combined" else [dataset.exchange])
++        if exchange != "combined"
++    })
++
++
+ @simulation_data_scope
+ async def run_backtest_suite_async(
+     config: Dict[str, Any],
+@@ -2232,10 +2242,9 @@ async def run_backtest_suite_async(
+     if not available_coins:
+         raise ValueError("No coins available after preparing master datasets.")
+ 
+-    if len(datasets) == 1 and "combined" in datasets:
+-        dataset_available_exchanges = datasets["combined"].available_exchanges
+-    else:
+-        dataset_available_exchanges = [ds.exchange for ds in datasets.values()]
++    # A combined dataset is synthetic; its contributing exchanges still exist
++    # when individual datasets are also prepared for restricted scenarios.
++    dataset_available_exchanges = _dataset_available_exchanges(datasets)
+ 
+     # Deduplicate scenarios that resolve to identical effective inputs.
+     seen_signatures: Dict[str, str] = {}
+diff --git a/tests/test_suite_runner.py b/tests/test_suite_runner.py
+index 4fedffbec..3299bac0d 100644
+--- a/tests/test_suite_runner.py
++++ b/tests/test_suite_runner.py
+@@ -1233,3 +1233,12 @@ def test_saved_suite_config_preserves_effective_exchange_defaults(monkeypatch, t
+     assert observed == [["bybit"]]
+     assert resumed[0].exchanges == observed[0]
+     assert config["backtest"]["exchanges"] == ["binance"]
++
++
++def test_mixed_dataset_exchange_universe_preserves_combined_contributors():
++    from suite_runner import _dataset_available_exchanges
++    combined = SimpleNamespace(exchange="combined", available_exchanges=["binance", "bybit"])
++    restricted = SimpleNamespace(exchange="binance")
++    assert _dataset_available_exchanges({"combined": combined, "binance": restricted}) == ["binance", "bybit"]
++    assert _dataset_available_exchanges({"combined": combined}) == ["binance", "bybit"]
++    assert _dataset_available_exchanges({"binance": restricted}) == ["binance"]
