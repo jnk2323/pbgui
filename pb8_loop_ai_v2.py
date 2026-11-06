@@ -314,7 +314,13 @@ async def run_decision(ai, record, stage, evidence):
             row.update(ai_snapshot_id=snapshot['id'], ai_snapshot_stage=stage, ai_snapshot_round=record['round'],
                        knowledge_summary={key: package[key] for key in ('eligible', 'included', 'omitted', 'excluded')})
         await owned_thread(ai.store.update, record['owner'], record['id'], bind)
-    session = evidence_session(evidence_store, snapshot, profile, native=settings['provider'] in {'chatgpt', 'claude-code'})
+    try:
+        # Pure construction may be abandoned; it cannot publish storage writes.
+        session = await asyncio.wait_for(asyncio.to_thread(
+            evidence_session, evidence_store, snapshot, profile,
+            native=settings['provider'] in {'chatgpt', 'claude-code'}), 30)
+    except TimeoutError as exc:
+        raise LoopAIPause('evidence_recovery', 'Mandatory evidence preparation exceeded 30 seconds; review the snapshot before resuming') from exc
     fallback_fresh = fallback_fresh or bool(snapshot['data'].get('historical_sources', {}).get('fallback_fresh'))
     instructions = instructions_for_run(record)['text'] + PROTOCOL
     output = min(metadata.get('output_limit') or 32768, profile.get('output_tokens', 32768))
