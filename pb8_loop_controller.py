@@ -342,7 +342,11 @@ class LoopController:
         token = (record.get('id'), uuid.uuid4().hex)
         self._active_decisions.add(token)
         try:
-            return await self.ai.decide(record, stage, evidence)
+            try:
+                async with asyncio.timeout(record['settings'].get('decision_timeout_seconds') or 600):
+                    return await self.ai.decide(record, stage, evidence)
+            except TimeoutError as exc:
+                raise LoopAIPause('ai_timeout', 'AI decision including evidence preparation timed out') from exc
         finally:
             self._active_decisions.discard(token)
 

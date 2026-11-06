@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import time
 import zlib
 
 from file_lock import advisory_file_lock
@@ -21,7 +22,9 @@ MAX_OBJECT_BYTES = 4 * 1024 * 1024
 CACHE_BYTES = 4 * 1024 * 1024
 HOT_FIELDS = ('id', 'owner', 'status', 'phase', 'round', 'control_generation',
               'created_at', 'updated_at', 'started_at', 'deadline', 'cleanup_done')
-CONFIG_FIELDS = {'config', 'executed_config', 'initial_config', 'overrides', 'initial_overrides'}
+CONFIG_FIELDS = {'config', 'executed_config', 'initial_config', 'overrides', 'initial_overrides',
+                 'metrics', 'metric_statistics', 'metric_basis', 'native_semantics'}
+ARCHIVE_OPERATION_SECONDS = 60
 
 
 class LoopStorageError(OSError):
@@ -141,9 +144,11 @@ class ObjectSession:
         self.cache = OrderedDict()
         self.cache_size = 0
         self.written = set()
+        self.deadline = time.monotonic() + ARCHIVE_OPERATION_SECONDS
 
     def put(self, value):
         """Deduplicate unchanged nodes/configurations rather than copying run snapshots."""
+        self.check_deadline()
         raw = encoded(value)
         if len(raw) > MAX_OBJECT_BYTES:
             raise LoopStorageError('An individual Loop archive object exceeds its safe size')
@@ -153,11 +158,17 @@ class ObjectSession:
             self.written.add(key)
         return ['ref', key]
 
+    def check_deadline(self):
+        """Fail visibly rather than monopolizing the controller on a huge archive."""
+        if time.monotonic() >= self.deadline:
+            raise LoopStorageError("Loop archive operation timed out after 60 seconds")
+
     def object(self, reference):
         """Verify immutable bytes before decoding; bound decompression and cached data."""
         if (not isinstance(reference, list) or len(reference) != 2 or reference[0] != 'ref'
                 or not isinstance(reference[1], str) or not re.fullmatch(r'[a-f0-9]{64}', reference[1])):
             raise LoopStorageError('Invalid Loop archive reference')
+        self.check_deadline()
         key = reference[1]
         raw = self.cache.get(key)
         if raw is None:
@@ -195,7 +206,7 @@ class ObjectSession:
 
     def pack(self, value, name=None):
         """Archive complete configurations once, and mutable collections as chunked trees."""
-        if name in CONFIG_FIELDS and isinstance(value, dict):
+        if name in CONFIG_FIELDS and isinstance(value, dict) and len(encoded(['json', value])) <= MAX_OBJECT_BYTES:
             return self.put(['json', value])
         if isinstance(value, dict):
             return self.sequence('dict', [[key, self.pack(item, key)] for key, item in value.items()])

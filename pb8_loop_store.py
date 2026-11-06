@@ -611,7 +611,7 @@ class LoopStore:
         """Keep immutable JSON bytes; decode independent caller values outside the lock."""
         snapshot = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
         size = len(snapshot)
-        if size > READ_CACHE_BYTES // 2:
+        if size > READ_CACHE_BYTES:
             return
         with self._read_cache_lock:
             old = self._read_cache.pop(path, None)

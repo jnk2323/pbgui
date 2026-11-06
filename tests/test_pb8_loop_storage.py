@@ -687,3 +687,41 @@ def test_hot_display_cache_cannot_hide_identity_or_archive_tampering(record, cor
                                       (zlib.compress(b'corrupt'), header['_loop_storage']['root'][1]))
     with pytest.raises((ValueError, FileNotFoundError, LoopStorageError)):
         store.read(OWNER, row['id'], fields={'status', 'settings'}, prefer_cached_fields=True)
+
+
+def test_metric_payloads_use_bounded_opaque_nodes_without_aliasing(tmp_path):
+    archive = LoopArchive(tmp_path, 'a' * 32)
+    statistics = {f'metric_{i}': {'min': i, 'mean': i + 1, 'max': i + 2} for i in range(196)}
+    root = archive.save({'candidates': [{'metric_statistics': statistics}, {'metric_statistics': statistics}]})
+    with archive.connection() as session:
+        candidates = session.field(root, 'candidates')
+        first = next(session.entries(candidates, 0, 1))
+        assert session.object(session.field(first, 'metric_statistics'))[0] == 'json'
+    result = archive.load(root)
+    result['candidates'][0]['metric_statistics']['metric_0']['min'] = -1
+    assert result['candidates'][1]['metric_statistics']['metric_0']['min'] == 0
+
+
+def test_archive_operation_has_explicit_deadline(tmp_path):
+    archive = LoopArchive(tmp_path, 'b' * 32)
+    root = archive.save({'items': [1, 2, 3]})
+    with archive.connection() as session:
+        session.deadline = 0
+        with pytest.raises(LoopStorageError, match='timed out'):
+            session.unpack(root)
+
+
+def test_decision_timeout_includes_evidence_preparation(record, monkeypatch):
+    from pb8_loop_evidence import LoopAIPause
+    import ai_loop_windows
+    store, row = record
+    row['settings']['decision_timeout_seconds'] = 0.01
+    monkeypatch.setattr(ai_loop_windows, 'require_holdout_evidence_policy', lambda _: None)
+
+    async def stalled(*args):
+        await asyncio.Event().wait()
+
+    controller = LoopController(store.root.parent, store=store, ai=SimpleNamespace(decide=stalled))
+    with pytest.raises(LoopAIPause, match='including evidence preparation timed out'):
+        asyncio.run(controller.decision(row, 'select', {}))
+    assert not controller._active_decisions
