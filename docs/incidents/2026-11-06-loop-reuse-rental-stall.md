@@ -22,3 +22,17 @@ silently buy a second one after failure or deletion. Do not retry if a reservati
 or provider attempt already exists. Use native supervisors to provision/dispatch.
 
 Regression coverage preserves both reuse-only and handover no-purchase fences.
+
+## Verified recovery
+
+A single worker `ab105eb585f44252a2f2e5df6cbbc925` reserved instance `59467216`
+(RTX 3060, GPU rate $0.0755556/h), with durable `budget_usd=3.5`.
+Runner log: instance confirmed 21:39:53 server time; optimizer provisioning
+21:40:08; `worker_ready=true`, uploading 21:41:11. Transient SSH identity/auth
+warnings cleared without intervention. No service restart was needed.
+
+Checks: focused purchase-fence and rental-hours tests: **6 passed**. Broader
+loop optimizer/rental-controls suite: **386 passed, 4 blocked** by missing native
+Chromium (`Install a native Chromium browser or set PBGUI_TEST_BROWSER`). No
+application behavior was changed: this was an explicit state/authorization
+recovery, with regression protection for the purchase fence.
