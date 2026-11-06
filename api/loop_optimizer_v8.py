@@ -1231,7 +1231,10 @@ async def best_config(loop_id: str, session: SessionToken = Depends(require_auth
 
 @router.post('/{loop_id}/action')
 async def loop_action(loop_id: str, body: LoopAction, session: SessionToken = Depends(require_auth)):
-    return await _loop_action_owned(_owner(session), loop_id, body)
+    try:
+        return await asyncio.wait_for(_loop_action_owned(_owner(session), loop_id, body), 60)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=409, detail='Loop control exceeded 60 seconds; inspect current status before retrying. No new loop was created.') from exc
 
 
 @router.post('/{loop_id}/handover')
@@ -1461,10 +1464,10 @@ async def _loop_action_owned(owner, loop_id, body):
                 from pb8_loop_evidence import EvidenceStore
                 snap = await asyncio.to_thread(EvidenceStore(_controller.store).load, owner, waiting['ai_snapshot_id'])
                 from pb8_loop_ai_v2 import validate_snapshot_budget
-                validate_snapshot_budget({**waiting, 'settings': validated}, snap, metadata)
+                await asyncio.to_thread(validate_snapshot_budget, {**waiting, 'settings': validated}, snap, metadata)
                 for evidence_id, binding in snap['history'].items():
                     if binding.get('required'):
-                        EvidenceStore(_controller.store).resolve(snap, '/history/' + evidence_id.replace('~','~0').replace('/','~1'))
+                        await asyncio.to_thread(EvidenceStore(_controller.store).resolve, snap, '/history/' + evidence_id.replace('~','~0').replace('/','~1'))
             def resume(current):
                 if current['status'] != 'paused' or current['control_generation'] != waiting['control_generation']:
                     raise ValueError('Loop changed while resuming')

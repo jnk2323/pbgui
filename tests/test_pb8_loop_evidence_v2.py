@@ -236,3 +236,64 @@ def test_opencode_context_counts_whole_replayed_history():
     with pytest.raises(LoopAIPause) as error:
         check_context({'messages': [{'content': '0123456789' * 100000}]}, profile(), 32768)
     assert error.value.reason == 'context_budget'
+
+
+def test_cancelled_evidence_reader_cannot_charge_or_publish(record):
+    evidence, value = snapshot(record)
+    session = EvidenceSession(evidence, value, 1500)
+    charged = []
+    session.charge = lambda: charged.append(True)
+    session.cancelled.set()
+    with pytest.raises(LoopAIPause, match='cancelled'):
+        session.read({'path': '/required', 'offset': 0}, 'cancelled')
+    assert charged == []
+    assert not session.cache
+
+
+def test_large_evidence_containers_are_not_tokenized_as_a_whole(monkeypatch):
+    import pb8_loop_evidence as module
+    original = module.tokens
+    def bounded(value):
+        assert not isinstance(value, list) or len(value) < 100
+        return original(value)
+    monkeypatch.setattr(module, 'tokens', bounded)
+    value = [{'metric': n, 'name': 'candidate'} for n in range(1000)]
+    leaves = list(module.records(value, '/data'))
+    assert len(leaves) == 1000
+
+
+def test_optional_page_stops_before_later_candidates(record, monkeypatch):
+    import pb8_loop_evidence as module
+    evidence, value = snapshot(record)
+    session = EvidenceSession(evidence, value, 1500)
+    visited = []
+    original = module.records
+    def tracked(value, path='', check=lambda: None):
+        for item in original(value, path, check):
+            visited.append(item['path'])
+            yield item
+    monkeypatch.setattr(module, 'records', tracked)
+    pages = session.pages([{'value': 'metric ' * 100} for _ in range(1272)], '/data/evidence/candidates', target_offset=0)
+    assert len(pages) == 1
+    assert pages[0]['offset'] == 0
+    assert pages[0]['complete'] is False
+    assert pages[0]['next_offset'] > 0
+    assert len(visited) < 100
+
+
+def test_startup_orphan_reconciliation_preserves_reservation(record, tmp_path):
+    from pb8_loop_controller import LoopController
+    store, row = record
+    reservation = {'id': 'reserved-call', 'tokens_reserved': 123, 'usd_reserved': 0.25}
+    store.update(row['owner'], row['id'], lambda current: current.update(status='running', pending_ai=reservation))
+    controller = LoopController(tmp_path, store=store, backend=SimpleNamespace(), ai=SimpleNamespace())
+    async def no_work(_row):
+        pass
+    controller._tick = no_work
+    controller.observers.tick = no_work
+    asyncio.run(controller.tick(row['owner'], row['id']))
+    current = store.read(row['owner'], row['id'])
+    assert current['status'] == 'paused'
+    assert current.get('pending_ai') is None
+    assert current['interrupted_ai'] == reservation
+    assert current['control_generation'] == row['control_generation'] + 1

@@ -433,7 +433,7 @@ class OpenCodeDialog:
                             raise LoopAIPause('evidence_recovery', 'An unregistered tool was requested')
                         try:
                             from pb8_loop_controller import owned_thread
-                            result = await owned_thread(self.session.read, call['arguments'], call['id'])
+                            result = await self.session.read_bounded(call['arguments'], call['id'])
                         except LoopAIPause as exc:
                             if exc.reason != 'evidence_recovery' or dialog == 1:
                                 raise

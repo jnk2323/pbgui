@@ -64,6 +64,7 @@ class LoopController:
         self._active_decisions = set()
         self._evidence_retention_at = 0
         self._idle_paused = {}
+        self._reconciled = set()
         self.restart_pending = lambda: False
 
     def start(self):
@@ -217,6 +218,24 @@ class LoopController:
                 await owned_thread(self.store.pause_storage, owner, loop_id, exc)
                 _log(SERVICE, f'Loop {loop_id} archive cannot be read: {exc}', level='ERROR')
                 return
+            # The controller flock proves no previous process owns this step.
+            # Retain billing reservations; never silently replay an orphaned request.
+            identity = (owner, loop_id)
+            if identity not in self._reconciled:
+                self._reconciled.add(identity)
+                if record.get('pending_ai') and record['status'] in ACTIVE:
+                    def reconcile(current):
+                        if current['control_generation'] != record['control_generation']:
+                            return
+                        pending = current.pop('pending_ai', None)
+                        if pending:
+                            current['interrupted_ai'] = pending
+                            current.update(status='paused', control_generation=current['control_generation'] + 1,
+                                last_error='Orphaned model request retained after API restart; review before resume',
+                                ai_pause={'reason': 'evidence_recovery',
+                                          'message': 'Orphaned model request retained after API restart; review before resume',
+                                          'details': {}, 'at': time.time(), 'phase': current['phase']})
+                    record = await owned_thread(self.store.update, owner, loop_id, reconcile)
             phase_before = record.get('phase')
             try:
                 await self._tick(record)
@@ -251,6 +270,8 @@ class LoopController:
                 def failed(current):
                     waiting_handover = (current['status'] == 'queued'
                                         and (current.get('rental_handover') or {}).get('status') == 'collecting')
+                    if current['control_generation'] != record['control_generation']:
+                        return
                     if current['status'] not in ACTIVE and not waiting_handover:
                         return
                     current['errors'] += 1

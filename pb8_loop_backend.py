@@ -349,7 +349,7 @@ class LoopBackend:
 
     def _rent(self, record):
         """Rent only for owned jobs within the frozen and current shared limits."""
-        if record.get('rental_handover'):
+        if record.get('rental_handover') or record.get('rental_reuse_only'):
             # A reviewed replacement is bound to one existing rental, including
             # after failure/deletion. Never silently buy another GPU for it.
             return

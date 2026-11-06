@@ -279,11 +279,11 @@ class DecisionLedger:
         self.store.update(self.record['owner'], self.record['id'], reserve)
         return call_id
 
-    def reserve_tool(self):
+    def reserve_tool(self, cancelled=None):
         """Do not replenish the logical decision's tool quota after retry or resume."""
         def charge(row):
             """Count under the same cross-process lock as billing and control changes."""
-            if row['control_generation'] != self.record['control_generation'] or row['status'] not in {'running','finishing'}:
+            if (cancelled is not None and cancelled.is_set()) or row['control_generation'] != self.record['control_generation'] or row['status'] not in {'running','finishing'}:
                 raise LoopAIPause('evidence_recovery', 'Loop control changed before the evidence read')
             state = row['ai_decisions'][self.key]
             used = state.get('tool_calls', 0)

@@ -551,16 +551,24 @@ class EvidenceStore:
                      level='WARNING', meta={'bytes': size})
 
 
-def records(value, path=''):
+def records(value, path='', check=lambda: None):
     """Bundle small subtrees, split larger ones in deterministic pointer order."""
-    if path and tokens(value) <= 900:
+    check()
+    # Never tokenize an entire archive merely to decide whether to split it.
+    # The bounded encoder short-circuits large containers before tokenization.
+    size = 0
+    for fragment in json.JSONEncoder(ensure_ascii=False).iterencode(value):
+        size += len(fragment)
+        if size > 3600:
+            break
+    if path and size <= 3600 and tokens(value) <= 900:
         yield {'path': path, 'value': value}
     elif isinstance(value, dict) and value:
         for key, child in value.items():
-            yield from records(child, path + '/' + key.replace('~', '~0').replace('/', '~1'))
+            yield from records(child, path + '/' + key.replace('~', '~0').replace('/', '~1'), check)
     elif isinstance(value, list) and value:
         for index, child in enumerate(value):
-            yield from records(child, path + '/' + str(index))
+            yield from records(child, path + '/' + str(index), check)
     else:
         yield {'path': path, 'value': value}
 
@@ -573,6 +581,7 @@ class EvidenceSession:
             raise ValueError('Invalid evidence page profile')
         self.store, self.snapshot, self.page_tokens = evidence_store, snapshot, page_tokens
         self.lock = threading.RLock()
+        self.cancelled = threading.Event()
         self.charge = None
         self.dialog = -1
         self.total_calls = 0
@@ -598,42 +607,58 @@ class EvidenceSession:
         self.covered, self.seen = set(), set()
         self.intervals = {}
 
-    def pages(self, value, path):
-        """Create actual bounded JSON pages, including metadata and scalar chunks."""
-        entries = []
-        for entry in records(value):
-            if tokens(entry) + 180 <= self.page_tokens:
-                entries.append(entry)
-                continue
-            text = entry['value']
-            if not isinstance(text, str):
-                raise LoopAIPause('context_budget', 'An evidence scalar cannot fit its page profile')
-            offset = 0
-            while offset < len(text):
-                low, high, best = 1, len(text) - offset, None
-                while low <= high:
-                    count = (low + high) // 2
-                    fragment = {'path': entry['path'], 'value': text[offset:offset + count],
-                                'char_offset': offset, 'char_end': offset + count, 'characters': len(text)}
-                    if tokens(fragment) + 180 <= self.page_tokens:
-                        best, low = fragment, count + 1
-                    else:
-                        high = count - 1
-                if best is None:
-                    raise LoopAIPause('context_budget', 'Evidence pointer exceeds page profile')
-                entries.append(best)
-                offset = best['char_end']
+    def pages(self, value, path, target_offset=None):
+        """Stream deterministic pages; optional reads never materialize later pages."""
+        limit = 20 if target_offset is not None else 120
+        deadline = time.monotonic() + limit
+        def check():
+            if self.cancelled.is_set() or time.monotonic() >= deadline:
+                raise LoopAIPause('evidence_recovery', f'Evidence preparation exceeded its {limit} second bound; request a narrower evidence pointer')
+        def entries():
+            for entry in records(value, check=check):
+                check()
+                if tokens(entry) + 180 <= self.page_tokens:
+                    yield entry
+                    continue
+                text = entry['value']
+                if not isinstance(text, str):
+                    raise LoopAIPause('context_budget', 'An evidence scalar cannot fit its page profile')
+                offset = 0
+                while offset < len(text):
+                    check()
+                    low, high, best = 1, len(text) - offset, None
+                    while low <= high:
+                        check()
+                        count = (low + high) // 2
+                        fragment = {'path': entry['path'], 'value': text[offset:offset + count],
+                                    'char_offset': offset, 'char_end': offset + count, 'characters': len(text)}
+                        if tokens(fragment) + 180 <= self.page_tokens:
+                            best, low = fragment, count + 1
+                        else:
+                            high = count - 1
+                    if best is None:
+                        raise LoopAIPause('context_budget', 'Evidence pointer exceeds page profile')
+                    yield best
+                    offset = best['char_end']
         result, current, start = [], [], 0
-        for entry in entries:
+        for entry in entries():
+            check()
             candidate = self.envelope(path, start, current + [entry], False)
             if current and tokens(candidate) > self.page_tokens:
-                result.append(self.envelope(path, start, current, False))
+                page = self.envelope(path, start, current, False)
+                if target_offset is not None and start == target_offset:
+                    return [page]
+                if target_offset is None:
+                    result.append(page)
                 start += len(current)
                 current = []
+                if target_offset is not None and start > target_offset:
+                    return []
             current.append(entry)
             if tokens(self.envelope(path, start, current, False)) > self.page_tokens:
                 raise LoopAIPause('context_budget', 'Evidence page metadata exceeds safe profile')
-        result.append(self.envelope(path, start, current, True))
+        if target_offset is None or start == target_offset:
+            result.append(self.envelope(path, start, current, True))
         return result
 
     def envelope(self, path, offset, entries, complete):
@@ -686,6 +711,8 @@ class EvidenceSession:
                                           'If compaction occurs, recover every missing /required page first.')}
                 self.cache[cache_key] = (signature, result)
                 return result
+        if self.cancelled.is_set():
+            raise LoopAIPause('evidence_recovery', 'Evidence read was cancelled')
         self.calls += 1
         self.total_calls += 1
         if self.charge is not None:
@@ -704,15 +731,30 @@ class EvidenceSession:
         self.seen.add(signature)
         if self.calls > 32 and self.stalled >= 4:
             raise LoopAIPause('evidence_recovery', 'Repeated evidence reads made no progress')
-        pages = self.required_pages if path == '/required' else self.pages(self.store.resolve(self.snapshot, path), path)
+        pages = self.required_pages if path == '/required' else self.pages(self.store.resolve(self.snapshot, path), path, target_offset=offset)
         result = next((page for page in pages if page['offset'] == offset), None)
         if result is None:
             raise ValueError('Offset must match a returned page boundary')
         if self.covered is not None and (path == '/required' or path.startswith('/required/')):
             for entry in result['entries']:
                 self._mark(path + entry['path'], entry)
+        if self.cancelled.is_set():
+            raise LoopAIPause('evidence_recovery', 'Evidence read was cancelled')
         self.cache[cache_key] = (signature, result)
         return result
+
+    async def read_bounded(self, arguments, call_id):
+        """Only this read-only worker may detach; ledger charges are generation-fenced."""
+        import asyncio
+        task = asyncio.create_task(asyncio.to_thread(self.read, arguments, call_id))
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), 30)
+        except (asyncio.CancelledError, TimeoutError) as exc:
+            self.cancelled.set()
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            if isinstance(exc, TimeoutError):
+                raise LoopAIPause('evidence_recovery', 'Evidence read timed out after 30 seconds; request a narrower pointer or retry after reviewing the retained request') from exc
+            raise
 
     def missing(self):
         """Return whole required pages not re-read since the last compaction."""

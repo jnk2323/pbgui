@@ -324,7 +324,7 @@ async def run_decision(ai, record, stage, evidence):
         raise BootstrapWithoutAdvice(snapshot['data']['historical_sources'])
     ledger = await owned_thread(DecisionLedger, ai.store, record, stage, snapshot['sha256'], metadata)
     session.total_calls = (await owned_thread(ledger.state)).get('tool_calls', 0)
-    session.charge = ledger.reserve_tool
+    session.charge = lambda: ledger.reserve_tool(session.cancelled)
     active = {'session': session, 'ledger': ledger, 'profile': profile, 'instructions': instructions, 'metadata': metadata,
               'validate': lambda text: validate_decision(record, stage, snapshot['data']['evidence'], text)}
     token = _ACTIVE.set(active)
